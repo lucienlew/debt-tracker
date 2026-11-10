@@ -1,0 +1,2818 @@
+<!DOCTYPE html>
+<!--
+================================ NOTES FOR AI AGENTS ================================
+>>> REQUIRED: KEEP THIS NOTE UP TO DATE <<<
+- Read this whole note before changing anything in this file.
+- Every time you change this file, update this note IN THE SAME EDIT:
+  * add/remove/adjust any rule below that your change affects;
+  * move items between "still open" and done;
+  * add one line to the CHANGE LOG at the bottom (date, what changed, why).
+- If code and this note disagree, fix whichever is wrong — never leave them out of sync.
+- Keep it short: replace outdated lines rather than piling new ones on top.
+- No bloat, in the note or the code: before finishing, delete dead code, unused CSS and
+  duplicated logic that your change left behind, and prune the change log (see below).
+- A task is NOT finished until this note is updated.
+
+WHAT THIS IS
+- Single-file PWA debt ledger ("Debt Tracker"), built ONLY for iPhone 18 Pro (Safari +
+  Home Screen app). Don't "fix" iPhone-specific choices for desktop/Android.
+- Siblings not in this file: sw.js (service worker), manifest.json, apple-touch-icon.png.
+- Currency is SGD. All data is local to the device — there is no server or account.
+
+DATA — DON'T BREAK THESE
+- Storage: IndexedDB "debtTracker" (stores "meta" = ledger under key "ledger",
+  "receipts" = photo Blobs keyed by txn id). Falls back to localStorage, then memory.
+- Every write goes through persist() → flush(). Never write before bootOk is true
+  (an empty `state` would overwrite the real ledger).
+- Any change to the stored shape must also be handled in normalize() — it repairs and
+  validates EVERYTHING loaded from storage or a backup file. Treat imports as hostile.
+- Amounts are dollars rounded to 2dp (round2); amount entry works in cents.
+- txn_date / created_at / edited_at are ISO strings (string compare = date compare).
+- Settlements are ordinary transactions with settlement:1, in the opposite direction
+  to the balance, and must never push a balance past zero (add AND edit paths).
+- Transaction date and person are deliberately locked after creation (owner's design).
+- Import is replace-only via Store.replaceAll() (one atomic write). Keep it atomic.
+
+SECURITY — DON'T WEAKEN
+- Face ID lock = WebAuthn platform passkey used as a UI gate only. The ledger is NOT
+  encrypted at rest. Keys starting "debtTrackerFace…" in localStorage hold lock state.
+- Cancelling Face ID is not a failed attempt; 5 real failures = 15-min cool-down.
+  Erasing from the lock screen requires typing ERASE. Never add a one-tap bypass/wipe.
+- Fixed passkey user handle (debtTrackerFaceUser_v1) so re-enrolling doesn't pile up.
+- Escape all user/imported text with esc() before innerHTML. Receipt data URLs must
+  pass SAFE_IMG_URL. CSV cells go through csvCell() (formula-injection guard).
+- CSP meta tag blocks all off-site requests. Keep it; update it if you add a source.
+- Backups can be password-encrypted (PBKDF2-SHA256 310k → AES-256-GCM, format
+  "debt-tracker-encrypted"). Export uses the iOS share sheet (navigator.share); if iOS
+  refuses it (tap expired while the file was built), download() offers a "Share" toast.
+  The backup password field is cleared whenever the Backup sheet closes.
+
+MINIMALIST BY DESIGN — DON'T ADD THESE BACK (owner removed them on purpose)
+- Pull-to-refresh, long-press menus, custom date wheel (native date inputs are used),
+  trend chart, sticky balance bar, swipe between tabs, swipe-down-to-close sheets,
+  haptics, spring/slide-in animations, storage-usage display, coloured avatars,
+  light/dark picker (theme always follows the iPhone setting), merge-import,
+  person phone/notes (people are name-only), History filters/sort (one search box,
+  see searchBlob()/searchTerms(); list is always newest first), cross-tab sync
+  (a Home Screen PWA has its own storage).
+- Before adding any feature, ask: does it track a debt, or is it decoration?
+- iPhone-only code: no desktop layouts, mouse cursors, hardware-keyboard shortcuts
+  (Escape/Enter-on-row), Android meta, or <a download> fallback. Don't add them back.
+
+UI CONVENTIONS
+- Overlays: openOverlay()/closeOverlay(); register new sheets in SHEET_LAYERS so
+  backdrop-tap runs their cleanup. Z-order is in the CSS comment. Closing a sheet drops
+  the keyboard; opening one resets its scroll. Sheet errors go through showErrIn().
+- A hidden toast must not take taps (.with-action only gets pointer-events with .show).
+- App text is not selectable (body user-select:none); only fields are.
+- Dates in file names / CSV / search use toLocalDay() — local time, never UTC.
+- syncLock() also makes the page behind a sheet inert (VoiceOver).
+- --status-bar-h:54px black band = iPhone 18 Pro Dynamic Island safe area. Nothing
+  interactive above it.
+- Tap targets >= 44pt tall (small buttons get an invisible ::before hit area).
+  Monochrome UI: avatars are neutral grey.
+- Respect prefers-reduced-motion (global rule at end of <style>).
+- Owner prefers simple, direct wording for any user-facing text.
+- Keyboard only opens when the user taps a field: no auto-focus when a sheet opens, and
+  taps on a sheet are ignored for its first 300ms (stops the opening tap landing on a
+  field). Every input stays >= 16px or iOS zooms on focus. Return/Done saves a sheet.
+- Settle Up opens pre-filled with the full balance. Deleting one transaction has no
+  confirm sheet — the toast's Undo is the safety net. Person sheets opened from Manage
+  People return to it.
+
+TESTING
+- No build step. Syntax-check by extracting the main script block and running
+  `node --check` on it. (Don't write literal script/style tags inside this note.)
+- Serve over http to test; Chrome can't exercise Face ID or the share sheet (exports
+  need navigator.share) — those need a real iPhone.
+
+LAST REVIEW (Nov 2026) — still open
+- Ledger at-rest encryption (e.g. WebAuthn PRF) not done.
+- No due dates/reminders, no person search.
+- Editing or deleting a debt after it was settled can still leave a balance past zero.
+- Keyboard/viewport behaviour of the sheets has only been checked in desktop Chrome.
+- sw.js and manifest.json have not been reviewed.
+
+CHANGE LOG — MAX 5 LINES, newest first, one line each. When adding a 6th, delete the
+oldest. Anything still worth knowing belongs in the rules above, not here.
+- 2026-11-11: Bug-fix pass — ghost toast taps, export refused by iOS, UTC file dates,
+  stuck swipe rows, early backdrop dismiss, leftover keyboard/password, date-field layout.
+- 2026-11-11: iPhone-only trim — desktop/keyboard/Android code and unused CSS removed.
+- 2026-11-11: Smoothness pass — no keyboard/zoom surprises (search font, + / − / tick
+  focus, double-tap zoom), Return saves, settle pre-filled, one-tap delete with Undo.
+- 2026-11-11: Merge, person phone/notes, History filters and cross-tab sync removed;
+  one search box now covers name, amount, date, note, type and settlements.
+- 2026-11-11: Minimalist strip — decorative features removed; native date pickers;
+  theme follows the phone.
+=====================================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<!-- Blocks any network call or image load to another site, so even an injected script
+     has nowhere to send the ledger. Inline script/style stay allowed (single-file app). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover,maximum-scale=5.0">
+<meta name="theme-color" content="#0A0A0A">
+<meta name="color-scheme" content="light dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Debt Tracker">
+<meta name="format-detection" content="telephone=no">
+<title>Debt Tracker</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230A0A0A'/><text x='50' y='70' font-size='58' font-family='Helvetica,Arial' font-weight='bold' fill='white' text-anchor='middle'>$</text></svg>">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>
+:root{
+--bg:#F8F8F8;--card:#FFF;--text:#111;--dim:#767676;--line:#E4E4E4;
+--ink:#0A0A0A;--on-ink:#FFF;--chip:#F0F0F0;--chip-fg:#3D3D3D;--input:#F8F8F8;
+--summary:#0A0A0A;--banner:#111;--on-banner:#FFF;--track:#C7C7C7;--scrim:rgba(0,0,0,.5);
+--shadow:0 10px 30px rgba(0,0,0,.08);--fab-shadow:0 10px 26px rgba(0,0,0,.35);
+--danger:#B00020;--safe-b:env(safe-area-inset-bottom,0px);
+/* ================= iPhone 18 Pro geometry tokens (1 CSS px = 1 pt) =================
+   SAFETY CONTAINER — nothing interactive may sit above this line.                       */
+--status-bar-h:54px;                                         /* system status bar + Dynamic Island band */
+--safe-t:max(var(--status-bar-h),env(safe-area-inset-top,0px)); /* device inset wins if it is ever larger */
+--pad-content:16px;                                          /* gap between safe line and first content */
+--pad-side:20px;                                             /* structural side margin */
+color-scheme:light}
+body.dark{
+--bg:#000;--card:#1C1C1E;--text:#F2F2F2;--dim:#9A9A9E;--line:#303032;
+--ink:#F2F2F2;--on-ink:#000;--chip:#2C2C2E;--chip-fg:#D0D0D2;--input:#2C2C2E;
+--summary:#1C1C1E;--banner:#1C1C1E;--on-banner:#F2F2F2;--track:#3A3A3C;--scrim:rgba(0,0,0,.7);
+--shadow:none;--fab-shadow:0 10px 26px rgba(0,0,0,.6);
+color-scheme:dark}
+
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none}
+/* A long press never selects app text; only fields (and the error details) are selectable. */
+body{-webkit-user-select:none;user-select:none}
+input,select,.fatal pre{-webkit-user-select:text;user-select:text}
+html,body{overscroll-behavior-y:none;height:100%}
+/* No double-tap zoom on controls — a quick second tap on + or − used to zoom the page. */
+button,select,input,label,[role=button]{touch-action:manipulation}
+body{margin:0;min-height:100dvh;font-family:-apple-system,sans-serif;background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased}
+body.locked{overflow:hidden}
+.app{
+  /* top = 54pt safe line + 16pt; sides = 20pt structural margin */
+  padding:calc(var(--safe-t) + var(--pad-content)) var(--pad-side) calc(120px + var(--safe-b))}
+
+/* ================= Safety container =================
+   A fixed #000 band covering 0 → 54pt (status bar + Dynamic Island; iOS gives PWAs no access to the island). It blends into the hardware, keeps status-bar text
+   legible in light mode (status-bar-style is black-translucent = white text), and stops any
+   scrolled content from passing under the Dynamic Island. Non-interactive by design. */
+.status-safe{position:fixed;top:0;left:0;right:0;height:var(--safe-t);background:#000;z-index:99;pointer-events:none}
+
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+header h1{font-size:21px;letter-spacing:-.3px;margin:0;font-weight:800}
+.hdr-btns{display:flex;gap:8px}
+.icon-btn{position:relative;width:38px;height:38px;border-radius:50%;border:1px solid var(--line);background:var(--card);display:flex;align-items:center;justify-content:center;color:var(--text);flex-shrink:0;padding:0;transition:transform .12s ease,background .12s ease}
+.icon-btn:active{background:var(--chip);transform:scale(.9)}
+
+.banner{background:var(--banner);color:var(--on-banner);padding:11px 14px;border-radius:14px;font-size:12.5px;font-weight:600;margin-bottom:14px;line-height:1.45}
+.banner b{font-weight:800}
+
+.summary{background:var(--summary);border-radius:24px;padding:24px 20px;color:#fff;box-shadow:var(--shadow);margin-bottom:18px}
+.summary-label{font-size:11px;text-transform:uppercase;letter-spacing:1.4px;color:rgba(255,255,255,.5);font-weight:700}
+.summary-net{font-size:36px;font-weight:800;margin-top:6px;letter-spacing:-.8px;font-variant-numeric:tabular-nums}
+.summary-sub{font-size:13px;color:rgba(255,255,255,.55);margin-top:4px}
+
+.tabs{display:flex;gap:4px;margin-bottom:14px;background:var(--chip);padding:4px;border-radius:16px}
+
+.tab{flex:1;text-align:center;padding:9px 4px;font-size:13.5px;font-weight:700;color:var(--dim);border-radius:12px;border:none;background:none;font-family:inherit;transition:transform .12s ease}
+.tab.active{color:var(--on-ink);background:var(--ink)}
+.tab:active{transform:scale(.95)}
+
+.people{display:flex;flex-direction:column;gap:10px}
+.person-card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:15px 16px}
+.person-row{display:flex;justify-content:space-between;align-items:center;gap:8px;background:var(--card);transition:opacity .1s ease}
+.person-row:active{opacity:.55}
+.person-id-block{display:flex;align-items:center;gap:11px;min-width:0}
+.avatar{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  background:var(--chip);font-size:13.5px;font-weight:800;color:var(--chip-fg);flex-shrink:0;letter-spacing:.2px}
+.person-name{font-size:15.5px;font-weight:700}
+.person-meta{font-size:12px;color:var(--dim);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.balance{font-size:16px;font-weight:800;padding:5px 12px;border-radius:999px;white-space:nowrap;font-variant-numeric:tabular-nums;flex-shrink:0}
+.balance.pos{background:var(--ink);color:var(--on-ink)}
+.balance.neg{background:transparent;color:var(--ink);border:1.5px solid var(--ink)}
+.balance.zero{background:var(--chip);color:var(--dim)}
+.qa-actions{display:flex;gap:5px;flex-shrink:0;margin-right:2px}
+.qa-mini{position:relative;width:30px;height:30px;border-radius:50%;border:1px solid var(--line);background:var(--card);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:800;line-height:1;color:var(--dim);padding:0;flex-shrink:0;transition:transform .12s ease,background .12s ease}
+.qa-mini:active{transform:scale(.85);background:var(--chip)}
+/* Invisible hit areas: small visuals, >= 44pt tall touch targets (Apple HIG minimum). */
+.qa-mini::before{content:"";position:absolute;top:-7px;bottom:-7px;left:-3px;right:-3px}
+.icon-btn::before,.pt-icon-btn::before,.ios-switch::before{content:"";position:absolute;inset:-7px}
+.person-id-block>div:last-child{min-width:0}
+.person-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.banner-btn{display:block;width:100%;text-align:left;border:none;font-family:inherit}
+.banner-btn b{text-decoration:underline}
+.lock-erase-input{width:100%;padding:11px 14px;border-radius:14px;border:1.5px solid var(--line);font-size:16px;background:var(--input);color:var(--text);font-family:inherit;margin-bottom:10px;text-align:center;letter-spacing:1px}
+.lock-cant-panel .btn{width:100%}
+.lock-cant-panel .btn:disabled{opacity:.4}
+.person-detail{margin-top:13px;border-top:1px dashed var(--line);padding-top:12px}
+
+.empty{text-align:center;padding:54px 20px;color:var(--dim)}
+.empty .big{font-size:15px;font-weight:700;color:var(--text);margin-bottom:4px}
+
+.swipe-wrap{position:relative;overflow:hidden;border-radius:16px}
+.swipe-wrap:last-child .txn{border-bottom:none}
+.swipe-delete-bg{position:absolute;inset:0;background:var(--danger);color:#fff;font-weight:700;font-size:12.5px;border-radius:inherit}
+/* Fixed 19px flex box with no line-height leading — an inline span put the glyph on a
+   text baseline, so the descender gap pushed it off true vertical centre. */
+.swipe-delete-icon{position:absolute;top:50%;right:calc((var(--swipe-w,84px) - 19px)/2);transform:translateY(-50%);display:flex;align-items:center;justify-content:center;width:19px;height:19px;line-height:0}
+.swipe-content{position:relative;transition:transform .18s ease}
+.txn{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:11px 0;border-bottom:1px solid var(--line);background:var(--card);touch-action:pan-y;transition:background .1s ease}
+/* Must stay fully opaque: the red delete panel sits directly behind this row, so any
+   transparency on press bleeds it through and reads as a red highlight. */
+.txn:active{background:var(--chip)}
+.txn-left{display:flex;flex-direction:column;gap:2px;min-width:0}
+.txn-type{font-size:13px;font-weight:700}
+.txn-note{font-size:12.5px;color:var(--dim);word-break:break-word}
+.txn-meta{display:flex;gap:6px;align-items:center;margin-top:2px;flex-wrap:wrap}
+.txn-date{font-size:11px;color:var(--dim)}
+.txn-method,.txn-receipt-badge{font-size:10px;color:var(--chip-fg);background:var(--chip);padding:2px 7px;border-radius:20px;font-weight:600}
+.txn-right{display:flex;flex-direction:column;align-items:flex-end;gap:3px}
+.txn-amt{font-size:14px;font-weight:800;white-space:nowrap;font-variant-numeric:tabular-nums}
+.txn-amt.debit{color:var(--dim)}
+.txn-edited{font-size:10px;color:var(--dim);font-style:italic}
+.txn-person{font-size:11px;color:var(--chip-fg);font-weight:700}
+
+.search{display:block;width:100%;margin-bottom:12px;padding:11px 16px;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--text);font-family:inherit;font-size:16px;font-weight:600;line-height:1.2;-webkit-appearance:none;appearance:none}
+.search:focus{outline:none;border-color:var(--ink)}
+
+.fab{position:fixed;right:20px;bottom:calc(24px + var(--safe-b));width:58px;height:58px;border-radius:50%;background:var(--ink);color:var(--on-ink);display:flex;align-items:center;justify-content:center;box-shadow:var(--fab-shadow);font-size:28px;font-weight:700;border:none;z-index:40;line-height:1;padding-bottom:3px}
+.fab:active{transform:scale(.94)}
+
+.overlay{position:fixed;inset:0;background:var(--scrim);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:none;align-items:flex-end;justify-content:center;z-index:50}
+.overlay.open{display:flex;animation:scrimfade .22s ease}
+.overlay.opening .sheet{pointer-events:none}
+.overlay.closing{display:flex;pointer-events:none;animation:scrimfadeOut .26s cubic-bezier(.32,.72,0,1) forwards}
+@keyframes scrimfade{from{background-color:transparent;-webkit-backdrop-filter:blur(0);backdrop-filter:blur(0)}to{background-color:var(--scrim)}}
+@keyframes scrimfadeOut{from{opacity:1}to{opacity:0}}
+/* Layer order: sheets 50 < confirm 60 < lightbox 80 < fatal 95 < toast 100 */
+#confirmOverlay{z-index:60}
+.sheet{position:relative;background:var(--card);width:100%;border-radius:26px 26px 0 0;padding:22px 20px calc(26px + var(--safe-b));max-height:90dvh;overflow-y:auto;overscroll-behavior:contain;animation:slideup .32s cubic-bezier(.32,.72,0,1)}
+@keyframes slideup{from{transform:translateY(100%)}to{transform:translateY(0)}}
+.overlay.closing .sheet{animation:slidedown .26s cubic-bezier(.32,.08,.5,1) forwards}
+@keyframes slidedown{from{transform:translateY(0)}to{transform:translateY(100%)}}
+.sheet h2{margin:0 0 16px;font-size:17px;font-weight:800}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:11.5px;font-weight:700;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}
+.field input,.field select{width:100%;padding:11px 14px;border-radius:14px;border:1.5px solid var(--line);font-size:16px;background:var(--input);color:var(--text);font-family:inherit}
+.field input:focus,.field select:focus{outline:none;border-color:var(--ink)}
+/* iPhone date fields: stop the native control centring its text or outgrowing the sheet. */
+.field input[type=datetime-local]{display:block;min-width:0;min-height:46px;-webkit-appearance:none;appearance:none;text-align:left}
+.field input::-webkit-date-and-time-value{text-align:left}
+.field input:disabled,.field select:disabled{background:var(--chip);color:var(--dim);-webkit-text-fill-color:var(--dim);opacity:1}
+.type-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--chip);padding:4px;border-radius:15px}
+.type-opt{font-family:inherit;border:none;border-radius:12px;padding:11px 8px;text-align:center;font-size:12.5px;font-weight:700;color:var(--dim);background:none;transition:transform .12s ease}
+.type-opt.selected{background:var(--ink);color:var(--on-ink)}
+.type-opt:active{transform:scale(.95)}
+.type-grid.locked .type-opt{pointer-events:none}
+.type-grid.locked .type-opt:not(.selected){opacity:.4}
+.btn-row{display:flex;gap:10px;margin-top:6px}
+.btn{flex:1;padding:13px;border-radius:999px;border:none;font-size:14.5px;font-weight:700;font-family:inherit;transition:transform .12s ease}
+.btn:active{transform:scale(.96)}
+.btn-primary{background:var(--ink);color:var(--on-ink)}
+.btn-secondary{background:var(--chip);color:var(--text)}
+.btn-danger{background:var(--card);color:var(--text);border:1.5px solid var(--line)}
+.btn-confirm{background:var(--danger);color:#fff}
+.btn:disabled{opacity:.4}
+.lock-note,.receipt-status{font-size:11px;color:var(--dim);margin-top:6px}
+.err{color:var(--danger);font-size:12.5px;font-weight:700;margin-bottom:10px}
+.err:empty{display:none}
+.field-desc{font-size:13px;color:var(--dim);margin-bottom:16px;line-height:1.5}
+
+.row-action{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px;border:1.5px solid var(--line);border-radius:18px;margin-bottom:10px}
+.ra-title{font-size:14px;font-weight:700}
+.ra-sub{font-size:11.5px;color:var(--dim);margin-top:2px}
+.ra-btn{padding:9px 16px;border-radius:999px;border:none;background:var(--ink);color:var(--on-ink);font-size:12.5px;font-weight:700;white-space:nowrap;font-family:inherit;transition:transform .12s ease}
+.ra-btn:active{transform:scale(.94)}
+.ra-btn.secondary{background:var(--chip);color:var(--text)}
+.ra-btn.danger{background:var(--danger);color:#fff}
+#importFile,#receiptFile{display:none}
+
+.toast{position:fixed;left:50%;bottom:calc(96px + var(--safe-b));transform:translate(-50%,10px);background:var(--ink);color:var(--on-ink);padding:11px 18px;border-radius:999px;font-size:13px;font-weight:600;z-index:100;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;max-width:90%;text-align:left;display:flex;align-items:center;gap:10px;box-shadow:0 8px 24px rgba(0,0,0,.22)}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.toast.with-action.show{pointer-events:auto}
+.toast svg{flex-shrink:0}
+.toast button{background:none;border:none;color:inherit;font-family:inherit;font-size:13px;font-weight:800;text-decoration:underline;padding:2px 0;margin-left:4px;flex-shrink:0}
+.toast.success{background:#12703C;color:#fff}
+body.dark .toast.success{background:#1C8B4D}
+.toast.error{background:var(--danger);color:#fff}
+
+.receipt-row{display:flex;align-items:center;gap:10px}
+.receipt-thumb{width:52px;height:52px;border-radius:14px;object-fit:cover;border:1.5px solid var(--line);flex-shrink:0}
+.receipt-add-btn{padding:10px 16px;border-radius:14px;border:1.5px dashed var(--line);background:var(--input);font-size:12.5px;font-weight:700;color:var(--chip-fg);font-family:inherit}
+.receipt-remove{font-size:11.5px;font-weight:700;color:var(--danger);background:none;border:none;font-family:inherit;padding:0}
+.lightbox{position:fixed;inset:0;background:rgba(0,0,0,.9);display:none;align-items:center;justify-content:center;z-index:80;padding:24px}
+.lightbox.open{display:flex}
+.lightbox img{max-width:100%;max-height:100%;border-radius:18px}
+.lightbox-close{position:fixed;top:calc(18px + var(--safe-t));right:18px;width:38px;height:38px;border-radius:50%;background:rgba(255,255,255,.15);color:#fff;border:none;font-size:18px;display:flex;align-items:center;justify-content:center}
+
+/* Full-screen stop for a failed boot — deliberately above every other layer. */
+.fatal{position:fixed;inset:0;background:var(--bg);z-index:95;display:none;align-items:center;justify-content:center;padding:26px}
+.fatal.open{display:flex}
+.fatal-card{max-width:420px;width:100%;text-align:center}
+.fatal-icon{width:56px;height:56px;border-radius:50%;background:var(--danger);color:#fff;display:flex;align-items:center;justify-content:center;margin:0 auto 16px}
+.fatal h2{font-size:19px;font-weight:800;margin:0 0 8px;letter-spacing:-.2px}
+.fatal p{font-size:13.5px;color:var(--dim);line-height:1.6;margin:0 0 18px}
+.fatal details{text-align:left;background:var(--chip);border-radius:14px;padding:11px 13px;margin-bottom:18px;font-size:12px;color:var(--chip-fg)}
+.fatal summary{font-weight:700;list-style:none}
+.fatal summary::-webkit-details-marker{display:none}
+.fatal summary:after{content:" ▾"}
+.fatal pre{white-space:pre-wrap;word-break:break-word;margin:9px 0 0;font-size:11.5px;font-family:ui-monospace,Menlo,Consolas,monospace}
+.fatal .btn-row{flex-direction:column;gap:9px}
+
+.pt-row{display:flex;align-items:center;gap:8px;padding:10px 0;border-bottom:1px solid var(--line)}
+.pt-row:last-child{border-bottom:none}
+.pt-name{flex:1;font-size:14px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pt-row input{flex:1;padding:9px 12px;border-radius:12px;border:1.5px solid var(--line);font-size:16px;background:var(--input);color:var(--text);font-family:inherit;min-width:0}
+.pt-icon-btn{position:relative;width:32px;height:32px;border-radius:50%;border:none;background:var(--chip);color:var(--text);display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0;transition:transform .12s ease}
+.pt-icon-btn:active{transform:scale(.9)}
+.pt-icon-btn.danger{color:var(--danger)}
+.btn-danger,.ra-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px}
+.settle-max{font-size:12px;font-weight:700;color:var(--dim);background:none;border:none;font-family:inherit;padding:0;text-decoration:underline}
+
+/* ---- iOS-style toggle switch ---- */
+.ios-switch{width:51px;height:31px;border-radius:999px;background:var(--track);position:relative;border:none;padding:0;flex-shrink:0;transition:background .2s ease}
+.ios-switch::after{content:"";position:absolute;top:2px;left:2px;width:27px;height:27px;border-radius:50%;background:#fff;box-shadow:0 3px 8px rgba(0,0,0,.2);transition:transform .2s cubic-bezier(.32,.72,0,1)}
+.ios-switch.on{background:var(--ink)}
+.ios-switch.on::after{transform:translateX(20px)}
+
+/* ---- Show settled toggle row (above People list) ---- */
+.settled-row{display:none;align-items:center;justify-content:space-between;padding:0 4px 14px}
+.settled-row-label{font-size:13.5px;font-weight:700;color:var(--dim)}
+.person-card.is-settled{opacity:.55}
+
+/* ---- Face ID lock screen — deliberately above every other layer, including fatal. ---- */
+.lock-screen{position:fixed;inset:0;background:var(--bg);z-index:97;display:none;align-items:center;justify-content:center;padding:26px}
+.lock-screen.open{display:flex}
+.lock-card{max-width:300px;width:100%;text-align:center;display:flex;flex-direction:column;align-items:center}
+.lock-tile{width:88px;height:88px;border-radius:24px;background:var(--chip);color:var(--text);display:flex;align-items:center;justify-content:center;margin-bottom:22px}
+@keyframes lockPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.6;transform:scale(1.06)}}
+.lock-tile.scanning{animation:lockPulse 1.1s ease-in-out infinite}
+.lock-title{font-size:19px;font-weight:800;letter-spacing:-.3px;margin-bottom:6px}
+.lock-sub{font-size:13.5px;color:var(--dim);line-height:1.4;min-height:18px;margin-bottom:26px}
+.lock-sub.error{color:var(--danger);font-weight:600}
+.lock-btn{width:100%;display:flex;align-items:center;justify-content:center;gap:8px;padding:14px;border-radius:999px;border:none;background:var(--ink);color:var(--on-ink);font-size:14.5px;font-weight:700;font-family:inherit;transition:transform .12s ease}
+.lock-btn:active{transform:scale(.96)}
+.lock-btn:disabled{opacity:.5}
+.lock-link{margin-top:18px;background:none;border:none;font-size:12.5px;font-weight:600;color:var(--dim);font-family:inherit;text-decoration:underline;padding:6px}
+.lock-cant-panel{margin-top:8px;padding:14px;background:var(--card);border:1px solid var(--line);border-radius:16px;width:100%;text-align:left}
+.lock-cant-text{font-size:12px;color:var(--dim);line-height:1.5;margin-bottom:10px}
+/* Privacy cover while the app is in the background — the app switcher snapshot shows
+   this instead of your balances. Same screen, minus the controls. */
+.lock-screen.cover{display:flex}
+.lock-screen.cover .lock-btn,.lock-screen.cover .lock-link,.lock-screen.cover .lock-cant-panel,.lock-screen.cover .lock-sub{visibility:hidden}
+
+/* Reduce Motion (Settings → Accessibility → Motion): drop the remaining sheet slides. */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
+}
+</style>
+</head>
+<body>
+<!-- SAFETY CONTAINER (0 → 54pt): status bar + Dynamic Island. No app content lives here. -->
+<div class="status-safe" aria-hidden="true"></div>
+
+<!-- CORE CONTENT (starts at 54pt + 16pt) -->
+<div class="app">
+
+<header>
+  <div>
+    <h1>Debt Tracker</h1>
+  </div>
+  <div class="hdr-btns">
+    <button class="icon-btn" id="settingsBtn" aria-label="Settings">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
+    <button class="icon-btn" id="backupBtn" aria-label="Backup and restore">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    </button>
+  </div>
+</header>
+
+<div id="bannerSlot"></div>
+
+<div class="summary">
+  <div class="summary-label">Net Balance</div>
+  <div class="summary-net" id="netBalance">$0.00</div>
+  <div class="summary-sub" id="netSub">All accounts settled</div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-tab="overview">By Person</button>
+  <button class="tab" data-tab="history">History</button>
+</div>
+
+<div id="overviewTab">
+  <div class="settled-row" id="settledRow">
+    <span class="settled-row-label">Show settled</span>
+    <button type="button" class="ios-switch" id="settledToggle" role="switch" aria-checked="false" aria-label="Show settled people"></button>
+  </div>
+  <div class="people" id="peopleList"></div>
+</div>
+
+<div id="historyTab" hidden>
+  <input type="search" class="search" id="fSearch" placeholder="Search name, amount, date, note, owe, settled…" enterkeyhint="search" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" aria-label="Search history">
+  <div id="historyList"></div>
+</div>
+
+</div>
+
+<button class="fab" id="fabBtn" aria-label="Add debt">+</button>
+
+<!-- Add / edit transaction -->
+<div class="overlay" id="overlay">
+  <div class="sheet" role="dialog" aria-modal="true">
+    <h2 id="sheetTitle">Add Debt</h2>
+    <div class="err" id="formErr"></div>
+
+    <div class="field">
+      <label for="personSelect">Person</label>
+      <select id="personSelect"></select>
+      <input type="text" id="newPersonName" enterkeyhint="done" placeholder="Enter name" autocomplete="off" autocapitalize="words" style="margin-top:8px;">
+    </div>
+
+    <div class="field">
+      <label>Type</label>
+      <div class="type-grid" id="typeGrid">
+        <button type="button" class="type-opt" data-type="owed_to_me">Owed to Me</button>
+        <button type="button" class="type-opt" data-type="i_owe">I Owe</button>
+      </div>
+      <div class="lock-note" id="typeHint"></div>
+    </div>
+
+    <div class="field">
+      <label for="amountInput">Amount (SGD)</label>
+      <input type="text" id="amountInput" enterkeyhint="done" placeholder="0.00" inputmode="numeric" autocomplete="off">
+    </div>
+
+    <div class="field">
+      <label for="methodSelect">Payment Type</label>
+      <select id="methodSelect"></select>
+      <input type="text" id="newMethodName" placeholder="e.g. GrabPay" autocomplete="off" style="margin-top:8px;display:none;">
+      <div class="lock-note">How the money was given or received.</div>
+    </div>
+
+    <div class="field">
+      <label for="noteInput">Description (optional)</label>
+      <input type="text" id="noteInput" enterkeyhint="done" placeholder="e.g. Lunch, taxi fare, loan" autocomplete="off">
+    </div>
+
+    <div class="field">
+      <label for="dateInput">Date &amp; Time</label>
+      <input type="datetime-local" id="dateInput">
+      <div class="lock-note" id="dateLockNote">Set once — locked after the debt is created.</div>
+    </div>
+
+    <div class="field">
+      <label>Receipt (optional)</label>
+      <div class="receipt-row" id="receiptRow"></div>
+      <input type="file" id="receiptFile" accept="image/*">
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-danger" id="deleteBtn" style="display:none;">Delete</button>
+      <button class="btn btn-secondary" id="cancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="saveBtn">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add / edit person profile -->
+<div class="overlay" id="personOverlay">
+  <div class="sheet" role="dialog" aria-modal="true">
+    <h2 id="personSheetTitle">Edit Person</h2>
+    <div class="err" id="personErr"></div>
+    <div class="field-desc" id="personStats"></div>
+
+    <div class="field">
+      <label for="pName">Name</label>
+      <input type="text" id="pName" enterkeyhint="done" placeholder="Full name" autocomplete="off" autocapitalize="words">
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-danger" id="personDeleteBtn">Delete</button>
+      <button class="btn btn-secondary" id="personCancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="personSaveBtn">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settle up (full or partial) -->
+<div class="overlay" id="settleOverlay">
+  <div class="sheet" role="dialog" aria-modal="true">
+    <h2 id="settleTitle">Settle Up</h2>
+    <div class="err" id="settleErr"></div>
+    <div class="field-desc" id="settleDesc"></div>
+
+    <div class="field">
+      <label for="settleAmountInput">Amount (SGD)</label>
+      <input type="text" id="settleAmountInput" enterkeyhint="done" placeholder="0.00" inputmode="numeric" autocomplete="off">
+      <div class="lock-note"><button type="button" class="settle-max" id="settleMaxBtn">Use full amount</button></div>
+    </div>
+
+    <div class="field">
+      <label for="settleMethodSelect">Payment Type</label>
+      <select id="settleMethodSelect"></select>
+    </div>
+
+    <div class="field">
+      <label for="settleDateInput">Date &amp; Time</label>
+      <input type="datetime-local" id="settleDateInput">
+    </div>
+
+    <div class="field">
+      <label for="settleNoteInput">Description (optional)</label>
+      <input type="text" id="settleNoteInput" enterkeyhint="done" placeholder="e.g. Paid via bank transfer" autocomplete="off">
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="settleCancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="settleSaveBtn">Settle</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="backupOverlay">
+  <div class="sheet" role="dialog" aria-modal="true">
+    <h2>Backup &amp; Restore</h2>
+    <div class="field-desc" id="storageNote">Data — including receipt photos — is stored on this iPhone only. Export a backup regularly so you never lose the ledger.</div>
+    <div class="field">
+      <label for="backupPassword">Backup password</label>
+      <input type="password" id="backupPassword" placeholder="Recommended" autocomplete="new-password" spellcheck="false">
+      <div class="lock-note">Encrypts the backup file. Needed again to import it — there's no way to recover a forgotten password.</div>
+    </div>
+    <div class="row-action">
+      <div><div class="ra-title">Export Backup</div><div class="ra-sub" id="exportSub">Full .json — restores everything</div></div>
+      <button class="ra-btn" id="exportBtn">Export</button>
+    </div>
+    <div class="row-action">
+      <div><div class="ra-title">Import Backup</div><div class="ra-sub">Replaces your current ledger</div></div>
+      <button class="ra-btn secondary" id="importBtn">Import</button>
+    </div>
+    <div class="row-action">
+      <div><div class="ra-title">Export to Excel</div><div class="ra-sub">.csv of every transaction — not a backup</div></div>
+      <button class="ra-btn secondary" id="csvBtn">Export</button>
+    </div>
+    <input type="file" id="importFile" accept=".json,application/json">
+    <div class="btn-row"><button class="btn btn-secondary" id="closeBackupBtn">Close</button></div>
+  </div>
+</div>
+
+<div class="overlay" id="settingsOverlay">
+  <div class="sheet" role="dialog" aria-modal="true">
+    <h2>Settings</h2>
+    <div class="row-action" id="faceIdRow">
+      <div><div class="ra-title">Face ID Lock</div><div class="ra-sub" id="faceIdSub">Require Face ID to open the app.</div></div>
+      <button type="button" class="ios-switch" id="faceIdToggle" role="switch" aria-checked="false" aria-label="Face ID Lock"></button>
+    </div>
+    <div class="row-action">
+      <div><div class="ra-title">Manage People</div><div class="ra-sub">Add, edit, or remove people.</div></div>
+      <button class="ra-btn secondary" id="managePeopleBtn">Edit</button>
+    </div>
+    <div class="row-action">
+      <div><div class="ra-title">Payment Methods</div><div class="ra-sub">Rename or remove payment types.</div></div>
+      <button class="ra-btn secondary" id="paymentTypesBtn">Edit</button>
+    </div>
+    <div class="row-action" style="border-color:var(--danger);">
+      <div><div class="ra-title" style="color:var(--danger);">Delete All Data</div><div class="ra-sub">Erases every person, transaction, and receipt.</div></div>
+      <button class="ra-btn danger" id="deleteAllBtn">Delete All</button>
+    </div>
+    <div class="btn-row"><button class="btn btn-secondary" id="closeSettingsBtn">Close</button></div>
+  </div>
+</div>
+
+<div class="overlay" id="paymentTypesOverlay">
+  <div class="sheet" role="dialog" aria-modal="true">
+    <h2>Payment Methods</h2>
+    <div class="err" id="ptErr"></div>
+    <div id="ptList"></div>
+    <div class="field" style="margin-top:4px;">
+      <label for="ptNewInput">Add new</label>
+      <div style="display:flex;gap:8px;">
+        <input type="text" id="ptNewInput" placeholder="e.g. GrabPay" autocomplete="off" style="flex:1;">
+        <button class="ra-btn" id="ptAddBtn" type="button" style="flex-shrink:0;">Add</button>
+      </div>
+    </div>
+    <div class="btn-row"><button class="btn btn-secondary" id="ptCloseBtn">Close</button></div>
+  </div>
+</div>
+
+<div class="overlay" id="managePeopleOverlay">
+  <div class="sheet" role="dialog" aria-modal="true">
+    <h2>Manage People</h2>
+    <div class="row-action">
+      <div><div class="ra-title">Add Person</div><div class="ra-sub">Create a profile without logging a debt.</div></div>
+      <button class="ra-btn secondary" id="addPersonBtn">Add</button>
+    </div>
+    <div id="managePeopleList"></div>
+    <div class="btn-row"><button class="btn btn-secondary" id="managePeopleCloseBtn">Close</button></div>
+  </div>
+</div>
+
+<!-- Confirm is last in the DOM and highest z-index so it never hides behind a sheet -->
+<div class="overlay" id="confirmOverlay">
+  <div class="sheet" role="dialog" aria-modal="true">
+    <h2 id="confirmTitle">Are you sure?</h2>
+    <div class="field-desc" id="confirmMsg"></div>
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="confirmNoBtn">Cancel</button>
+      <button class="btn btn-secondary" id="confirmAltBtn" style="display:none;"></button>
+      <button class="btn btn-confirm" id="confirmYesBtn">Delete</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="deleteAllOverlay">
+  <div class="sheet" role="dialog" aria-modal="true">
+    <h2>Delete All Data</h2>
+    <div class="field-desc">This erases every person, transaction, and receipt on this device. It cannot be undone.</div>
+    <div class="field">
+      <label>Type DELETE to confirm</label>
+      <input type="text" id="deleteAllInput" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="DELETE">
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="deleteAllCancelBtn">Cancel</button>
+      <button class="btn btn-confirm" id="deleteAllConfirmBtn" disabled>Delete Everything</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="fatal" id="fatal">
+  <div class="fatal-card">
+    <div class="fatal-icon">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+    </div>
+    <h2>The ledger didn't load</h2>
+    <p id="fatalMsg">Your data hasn't been touched — the app has stopped before it could write anything over it.</p>
+    <details><summary>Technical details</summary><pre id="fatalDetail"></pre></details>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="fatalReload">Reload the app</button>
+      <button class="btn btn-danger" id="fatalExport">Export raw data</button>
+    </div>
+  </div>
+</div>
+
+<div class="lightbox" id="lightbox">
+  <button class="lightbox-close" id="lightboxClose" aria-label="Close">✕</button>
+  <img id="lightboxImg" src="" alt="Receipt">
+</div>
+
+<div class="lock-screen" id="lockScreen">
+  <div class="lock-card">
+    <div class="lock-tile" id="lockTile">
+      <svg width="46" height="46" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M10 20V14a4 4 0 0 1 4-4h6"/>
+        <path d="M44 10h6a4 4 0 0 1 4 4v6"/>
+        <path d="M10 44v6a4 4 0 0 0 4 4h6"/>
+        <path d="M54 44v6a4 4 0 0 1-4 4h-6"/>
+        <path d="M24 27v6"/>
+        <path d="M40 27v6"/>
+        <path d="M23 42q9 7 18 0"/>
+      </svg>
+    </div>
+    <div class="lock-title">Debt Tracker</div>
+    <div class="lock-sub" id="lockSub">Locked with Face ID</div>
+    <button type="button" class="lock-btn" id="lockRetryBtn">
+      <svg width="16" height="16" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 20V14a4 4 0 0 1 4-4h6"/><path d="M44 10h6a4 4 0 0 1 4 4v6"/><path d="M10 44v6a4 4 0 0 0 4 4h6"/><path d="M54 44v6a4 4 0 0 1-4 4h-6"/></svg>
+      Unlock with Face ID
+    </button>
+    <button type="button" class="lock-link" id="lockCantBtn">Can't use Face ID?</button>
+    <div class="lock-cant-panel" id="lockCantPanel" style="display:none">
+      <div class="lock-cant-text">Without Face ID, the only way in is to erase everything on this device and start fresh. If you have a backup file, you can restore it afterwards.</div>
+      <input type="text" class="lock-erase-input" id="lockEraseInput" placeholder="Type ERASE to confirm" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Type ERASE to confirm">
+      <button type="button" class="btn btn-danger" id="lockDisableBtn" disabled>Erase Data &amp; Start Fresh</button>
+    </div>
+    <div class="lock-cant-panel" id="lockLogoutPanel" style="display:none">
+      <div class="lock-cant-text" id="lockLogoutText">Too many failed attempts.</div>
+      <input type="text" class="lock-erase-input" id="lockLogoutInput" placeholder="Type ERASE to confirm" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Type ERASE to confirm">
+      <button type="button" class="btn btn-danger" id="lockLogoutBtn" disabled>Erase Data &amp; Start Fresh</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+"use strict";
+
+/* ================= Config ================= */
+const DB_NAME = "debtTracker", DB_VER = 1, S_META = "meta", S_RCPT = "receipts", LEDGER_KEY = "ledger";
+const LS_KEY = "debtTrackerData_v2";                 // legacy v2 store, migrated once
+const LS_LEDGER = "debtTrackerLedger_v3", LS_RCPT = "debtTrackerReceipts_v3";
+const MIGRATED_KEY = "debtTrackerMigrated_v3";
+const SETTLED_KEY = "debtTrackerShowSettled_v1", FACE_LOCK_KEY = "debtTrackerFaceLock_v1";
+const FACE_FAILS_KEY = "debtTrackerFaceFails_v1", LAST_EXPORT_KEY = "debtTrackerLastExport_v1";
+const BACKUP_REMIND_DAYS = 30;
+const DEFAULT_METHODS = ["Cash", "PayNow", "Card"];
+const TYPE_LABELS = {owed_to_me:"Owed to Me", i_owe:"I Owe"};
+const TYPE_HINTS = {owed_to_me:"This person owes you this amount.", i_owe:"You owe this person this amount."};
+const SWIPE_OPEN = -84, MAX_CENTS = 99999999999, UNDO_MS = 6000;
+document.documentElement.style.setProperty("--swipe-w", Math.abs(SWIPE_OPEN) + "px");
+
+const $ = id => document.getElementById(id);
+const elOf = t => t && (t.nodeType === 1 ? t : t.parentElement);
+const on = (node, ev, fn, opts) => node.addEventListener(ev, fn, opts);
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+/* Sheet errors sit at the top of the sheet — bring them into view if it's scrolled. */
+const showErrIn = (id, msg) => { const el = $(id); el.textContent = msg || ""; if(msg) el.scrollIntoView({block:"nearest"}); };
+
+/* ================= State ================= */
+const blank = () => ({people:[], paymentTypes:[...DEFAULT_METHODS], transactions:[], nextPersonId:1, nextTxnId:1});
+
+let state = blank();
+let currentTab = "overview";
+let openPersonId = null, editingTxnId = null, editingPersonId = null;
+let selectedType = null, txnDate = new Date(), amountCents = 0;
+let showSettled = false;
+
+/* Derived indexes — rebuilt once per data change, not per render. */
+let balanceOf = new Map(), txnsOf = new Map(), nameOf = new Map();
+let personById = new Map(), txnById = new Map(), searchText = new Map();
+let sortedTxns = [], totals = {owed:0, iowe:0};
+
+const round2 = n => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+const money = n => "$" + Math.abs(n).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+const signedAmount = t => t.type === "owed_to_me" ? t.amount : -t.amount;
+
+const ESC = {"&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"};
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ESC[c]);
+
+const dFmt = new Intl.DateTimeFormat(undefined, {year:"numeric", month:"short", day:"numeric"});
+const tFmt = new Intl.DateTimeFormat(undefined, {hour:"numeric", minute:"2-digit", hour12:true});
+const fmtDateTime = d => { const x = d instanceof Date ? d : new Date(d); return dFmt.format(x) + " · " + tFmt.format(x); };
+const validDate = d => d instanceof Date && !isNaN(d.getTime());
+const isFuture = d => d.getTime() > Date.now() + 5 * 60000;   // small grace for clock drift
+const SAFE_IMG_URL = /^data:image\/(?:jpeg|jpg|png|gif|webp|heic|heif);base64,[A-Za-z0-9+/=\s]+$/;
+/* Any stored timestamp that won't parse becomes null (or a fallback) instead of
+   crashing every render through the date formatter. */
+const isoOr = (v, fallback) => { const d = new Date(v); return v != null && v !== "" && validDate(d) ? d.toISOString() : fallback; };
+const pad2 = n => String(n).padStart(2, "0");
+/* Local calendar day (never UTC — that is yesterday before 8am in Singapore). */
+const toLocalDay = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+/* Value format of the native iPhone date pickers (local time). */
+const toLocalInput = d => `${toLocalDay(d)}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+
+/* Repairs legacy/corrupt data instead of trusting it blindly.
+   Legacy rows carry `receipt` as a data URL; those are pulled out into outReceipts
+   and the field is reduced to a 0/1 flag (photos live in their own store now). */
+function normalize(raw, outReceipts){
+  const s = blank();
+  if(!raw || typeof raw !== "object") return s;
+
+  const seenP = new Set();
+  (Array.isArray(raw.people) ? raw.people : []).forEach(p => {
+    if(!p || p.name == null) return;
+    const id = parseInt(p.id, 10), name = String(p.name).trim();
+    if(isNaN(id) || !name || seenP.has(id)) return;
+    seenP.add(id);
+    s.people.push({id, name});
+  });
+
+  /* An empty list is a deliberate choice (user removed every method) — keep it.
+     Only data that has no list at all (legacy) gets the defaults. */
+  if(Array.isArray(raw.paymentTypes)){
+    s.paymentTypes = [...new Set(raw.paymentTypes.map(m => String(m).trim()).filter(Boolean))];
+  }
+
+  const rawTxns = (Array.isArray(raw.transactions) ? raw.transactions : []).filter(
+    t => {
+      if(!t || !TYPE_LABELS[t.type] || !seenP.has(parseInt(t.person_id, 10))) return false;
+      const a = round2(parseFloat(t.amount));
+      return Number.isFinite(a) && a > 0 && a <= MAX_CENTS / 100;
+    }
+  );
+  /* Reserve every valid existing id first, so a repaired id can never steal one. */
+  const taken = new Set(), used = new Set();
+  rawTxns.forEach(t => { const id = parseInt(t.id, 10); if(!isNaN(id)) taken.add(id); });
+  let nextFree = 1;
+
+  rawTxns.forEach(t => {
+    let id = parseInt(t.id, 10);
+    if(isNaN(id) || used.has(id)){
+      while(taken.has(nextFree) || used.has(nextFree)) nextFree++;
+      id = nextFree;
+    }
+    used.add(id);
+    const d = new Date(t.txn_date);
+    /* Strict shape check: only a real base64 image data URL is accepted from a file,
+       so a crafted backup can't smuggle markup or script in through the photo field. */
+    const legacy = typeof t.receipt === "string" && SAFE_IMG_URL.test(t.receipt);
+    if(legacy && outReceipts) outReceipts.set(id, t.receipt);
+    s.transactions.push({
+      id,
+      person_id: parseInt(t.person_id, 10),
+      type: t.type,
+      amount: round2(parseFloat(t.amount)),
+      payment_type: t.payment_type ? String(t.payment_type) : "",
+      note: t.note ? String(t.note) : "",
+      txn_date: validDate(d) ? d.toISOString() : new Date().toISOString(),
+      created_at: isoOr(t.created_at, validDate(d) ? d.toISOString() : new Date().toISOString()),
+      edited: t.edited ? 1 : 0,
+      edited_at: isoOr(t.edited_at, null),
+      receipt: (legacy || t.receipt === 1 || t.receipt === true) ? 1 : 0,
+      settlement: t.settlement ? 1 : 0
+    });
+  });
+
+  /* Rebuild counters from data — never trust a stale counter. */
+  s.nextPersonId = s.people.reduce((m, p) => Math.max(m, p.id + 1), 1);
+  s.nextTxnId = s.transactions.reduce((m, t) => Math.max(m, t.id + 1), 1);
+  return s;
+}
+
+/* ================= Storage =================
+   IndexedDB is the primary store: quota is disk-based rather than localStorage's ~5 MB,
+   writes are async (no main-thread stall on photos), and receipts are kept as Blobs in
+   their own object store — so editing a note no longer rewrites megabytes of base64.
+   Falls back to localStorage, then to memory-only, without the UI caring which. */
+const Store = {
+  mode: "memory",                 // "idb" | "local" | "memory"
+  db: null,
+  memLedger: null,
+  memRcpt: new Map(),
+
+  async init(){
+    try{
+      this.db = await this.openDB();
+      this.mode = "idb";
+    }catch(e){
+      this.db = null;
+      /* A slow or blocked open is NOT "no IndexedDB": the real ledger is probably in there.
+         Falling back would show an empty ledger and start writing to the wrong store. */
+      if(e && e.transient) throw e;
+      try{
+        localStorage.setItem("__probe__", "1");
+        localStorage.removeItem("__probe__");
+        this.mode = "local";
+      }catch(e2){ this.mode = "memory"; }
+    }
+    return this.mode;
+  },
+  openDB(){
+    return new Promise((res, rej) => {
+      let req;
+      try{ req = indexedDB.open(DB_NAME, DB_VER); }catch(e){ return rej(e); }
+      req.onupgradeneeded = () => {
+        const d = req.result;
+        if(!d.objectStoreNames.contains(S_META)) d.createObjectStore(S_META);
+        if(!d.objectStoreNames.contains(S_RCPT)) d.createObjectStore(S_RCPT);
+      };
+      let settled = false;
+      const transient = msg => Object.assign(new Error(msg), {transient:true});
+      const timer = setTimeout(() => { settled = true; rej(transient("Storage took too long to open")); }, 8000);
+      req.onsuccess = () => {
+        const db = req.result;
+        if(settled){ db.close(); return; }          // late open after timeout — don't leak it
+        settled = true; clearTimeout(timer);
+        db.onversionchange = () => db.close();
+        res(db);
+      };
+      req.onerror = () => { if(settled) return; settled = true; clearTimeout(timer); rej(req.error || new Error("idb error")); };
+      req.onblocked = () => { if(settled) return; settled = true; clearTimeout(timer); rej(transient("Storage is in use by another tab")); };
+    });
+  },
+  tx(store, mode, fn){
+    return new Promise((res, rej) => {
+      let t;
+      try{ t = this.db.transaction(store, mode); }catch(e){ return rej(e); }
+      const req = fn(t.objectStore(store));
+      t.oncomplete = () => res(req ? req.result : undefined);
+      t.onerror = t.onabort = () => rej(t.error || new Error("tx failed"));
+    });
+  },
+
+  async loadLedger(){
+    if(this.mode === "idb") return this.tx(S_META, "readonly", s => s.get(LEDGER_KEY));
+    if(this.mode === "local"){
+      const raw = lsGet(LS_LEDGER);
+      return raw ? JSON.parse(raw) : null;
+    }
+    return this.memLedger;
+  },
+  async saveLedger(data){
+    if(this.mode === "idb") return this.tx(S_META, "readwrite", s => s.put(data, LEDGER_KEY));
+    if(this.mode === "local") return localStorage.setItem(LS_LEDGER, JSON.stringify(data));
+    this.memLedger = data;
+  },
+
+  /* Receipts: Blob under IDB, data URL under localStorage. Callers treat both via receiptURL(). */
+  async getReceipt(id){
+    if(this.mode === "idb") return (await this.tx(S_RCPT, "readonly", s => s.get(id))) || null;
+    if(this.mode === "local") return this.lsRcpt()[id] || null;
+    return this.memRcpt.get(id) || null;
+  },
+  async putReceipt(id, blob){
+    if(this.mode === "idb") return this.tx(S_RCPT, "readwrite", s => s.put(blob, id));
+    if(this.mode === "local"){
+      const map = this.lsRcpt();
+      map[id] = await blobToDataURL(blob);
+      return localStorage.setItem(LS_RCPT, JSON.stringify(map));
+    }
+    this.memRcpt.set(id, blob);
+  },
+  async delReceipt(ids){
+    const list = Array.isArray(ids) ? ids : [ids];
+    if(this.mode === "idb") return this.tx(S_RCPT, "readwrite", s => { list.forEach(i => s.delete(i)); });
+    if(this.mode === "local"){
+      const map = this.lsRcpt();
+      list.forEach(i => delete map[i]);
+      return localStorage.setItem(LS_RCPT, JSON.stringify(map));
+    }
+    list.forEach(i => this.memRcpt.delete(i));
+  },
+  async clear(){
+    if(this.mode === "idb") return Promise.all([
+      this.tx(S_META, "readwrite", s => s.clear()),
+      this.tx(S_RCPT, "readwrite", s => s.clear())
+    ]);
+    if(this.mode === "local"){
+      localStorage.removeItem(LS_LEDGER);
+      localStorage.removeItem(LS_RCPT);
+      return;
+    }
+    this.memLedger = null;
+    this.memRcpt.clear();
+  },
+  /* Swaps in a whole new ledger + photo set atomically (used by "Replace" import). */
+  async replaceAll(ledger, blobs){
+    if(this.mode === "idb"){
+      return new Promise((res, rej) => {
+        let t;
+        try{ t = this.db.transaction([S_META, S_RCPT], "readwrite"); }catch(e){ return rej(e); }
+        const meta = t.objectStore(S_META), rc = t.objectStore(S_RCPT);
+        meta.clear(); rc.clear();
+        meta.put(ledger, LEDGER_KEY);
+        blobs.forEach((b, id) => rc.put(b, id));
+        t.oncomplete = () => res();
+        t.onerror = t.onabort = () => rej(t.error || new Error("tx failed"));
+      });
+    }
+    if(this.mode === "local"){
+      const oldL = lsGet(LS_LEDGER), oldR = lsGet(LS_RCPT);
+      const map = {};
+      for(const [id, b] of blobs) map[id] = await blobToDataURL(b);
+      try{
+        localStorage.setItem(LS_RCPT, JSON.stringify(map));
+        localStorage.setItem(LS_LEDGER, JSON.stringify(ledger));
+      }catch(e){
+        try{
+          oldR == null ? localStorage.removeItem(LS_RCPT) : localStorage.setItem(LS_RCPT, oldR);
+          oldL == null ? localStorage.removeItem(LS_LEDGER) : localStorage.setItem(LS_LEDGER, oldL);
+        }catch(e2){}
+        throw e;
+      }
+      return;
+    }
+    this.memLedger = ledger;
+    this.memRcpt = new Map(blobs);
+  },
+  async receiptIds(){
+    if(this.mode === "idb") return (await this.tx(S_RCPT, "readonly", s => s.getAllKeys())) || [];
+    if(this.mode === "local") return Object.keys(this.lsRcpt()).map(Number);
+    return [...this.memRcpt.keys()];
+  },
+  lsRcpt(){
+    try{ return JSON.parse(lsGet(LS_RCPT) || "{}"); }catch(e){ return {}; }
+  }
+};
+
+const lsGet = k => { try{ return localStorage.getItem(k); }catch(e){ return null; } };
+showSettled = lsGet(SETTLED_KEY) === "1";
+const blobToDataURL = b => new Promise(res => {
+  const r = new FileReader();
+  r.onload = () => res(r.result);
+  r.onerror = () => res(null);
+  r.readAsDataURL(b);
+});
+function dataURLtoBlob(url){
+  const [head, b64] = String(url).split(",");
+  const mime = (head.match(/:(.*?);/) || [])[1] || "image/jpeg";
+  const bin = atob(b64 || "");
+  const arr = new Uint8Array(bin.length);
+  for(let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], {type:mime});
+}
+
+/* Writes are debounced and flushed when the page is hidden — a rapid edit
+   burst becomes one write instead of one per keystroke-driven save. */
+let saveTimer = null, saveDirty = false, bootOk = false;
+/* Until the boot load succeeds, `state` is an empty ledger — writing it out would
+   overwrite real data with nothing. Every write path funnels through here. */
+function persist(){
+  if(!bootOk) return;
+  saveDirty = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flush, 200);
+}
+async function flush(){
+  if(!saveDirty || !bootOk) return;
+  saveDirty = false;
+  clearTimeout(saveTimer);
+  try{ await Store.saveLedger(state); }
+  catch(e){ onStorageError(e); }
+}
+function onStorageError(e){
+  const full = e && (e.name === "QuotaExceededError" || e.code === 22);
+  showError(full ? "Storage is full — remove a receipt photo, or export and clear old entries."
+                 : "Couldn't save your change. Export a backup now.",
+    {label:"Export", fn:() => openOverlay(backupOverlay)});
+}
+on(window, "pagehide", () => { commitTrash(); flush(); });
+on(document, "visibilitychange", () => { if(document.hidden) flush(); });
+
+function showBanner(){
+  if($("privateBanner")) return;
+  const b = document.createElement("div");
+  b.id = "privateBanner";
+  b.className = "banner";
+  b.innerHTML = "⚠️ Storage is blocked (Private Browsing?) — data will NOT be saved. Use <b>Export</b> before you leave.";
+  $("bannerSlot").appendChild(b);
+}
+
+/* Nudge once a month: the ledger lives only on this iPhone, so an old backup is the
+   main way data gets lost. Tapping the banner opens Backup & Restore. */
+function remindBackup(){
+  if(Store.mode === "memory" || !state.transactions.length || $("backupReminder")) return;
+  const last = parseInt(lsGet(LAST_EXPORT_KEY) || "0", 10) || 0;
+  if(Date.now() - last < BACKUP_REMIND_DAYS * 86400000) return;
+  const b = document.createElement("button");
+  b.type = "button";
+  b.id = "backupReminder";
+  b.className = "banner banner-btn";
+  b.innerHTML = last
+    ? `Last backup was ${Math.floor((Date.now() - last) / 86400000)} days ago. <b>Back up now</b>`
+    : "You haven't backed up this ledger yet. <b>Back up now</b>";
+  b.onclick = () => openOverlay(backupOverlay);
+  $("bannerSlot").appendChild(b);
+}
+
+/* ================= Theme =================
+   Always follows the iPhone's Light/Dark setting, live. No in-app picker. */
+const themeMQ = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+const themeColorMeta = document.querySelector('meta[name="theme-color"]');
+function applyTheme(){
+  const dark = !!(themeMQ && themeMQ.matches);
+  document.body.classList.toggle("dark", dark);
+  /* These two hexes must stay in sync with --bg in :root and body.dark above. */
+  if(themeColorMeta) themeColorMeta.setAttribute("content", dark ? "#000000" : "#F8F8F8");
+}
+function loadTheme(){
+  applyTheme();
+  if(themeMQ && themeMQ.addEventListener) themeMQ.addEventListener("change", applyTheme);
+}
+
+/* ================= Face ID Lock =================
+   A local device gate, not encryption: WebAuthn's platform authenticator (Face ID /
+   iPhone) is used purely to prove the OS's biometric check passed
+   before the UI reveals anything. The credential id is kept per-device in localStorage
+   (never inside the ledger/backup) so it never travels with an export or import. */
+const b64uEncode = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const b64uDecode = str => {
+  const pad = "=".repeat((4 - str.length % 4) % 4);
+  const bin = atob((str + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  const arr = new Uint8Array(bin.length);
+  for(let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr.buffer;
+};
+function getFaceLock(){
+  try{
+    const v = JSON.parse(lsGet(FACE_LOCK_KEY) || "null");
+    return (v && v.enabled && v.credId) ? v : null;
+  }catch(e){ return null; }
+}
+function setFaceLock(v){
+  try{ v ? localStorage.setItem(FACE_LOCK_KEY, JSON.stringify(v)) : localStorage.removeItem(FACE_LOCK_KEY); }catch(e){}
+}
+async function faceIDSupported(){
+  if(!window.PublicKeyCredential || !navigator.credentials) return false;
+  try{ return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable(); }catch(e){ return false; }
+}
+/* One fixed user handle per device: iCloud Keychain replaces a passkey with the same
+   site + user handle, so turning the lock off and on again no longer piles up passkeys. */
+const FACE_USER_KEY = "debtTrackerFaceUser_v1";
+function faceUserId(){
+  let v = lsGet(FACE_USER_KEY);
+  if(!v){
+    v = b64uEncode(crypto.getRandomValues(new Uint8Array(16)));
+    try{ localStorage.setItem(FACE_USER_KEY, v); }catch(e){}
+  }
+  return new Uint8Array(b64uDecode(v));
+}
+async function enrollFaceID(){
+  const cred = await navigator.credentials.create({
+    publicKey:{
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp:{name:"Debt Tracker"},
+      user:{id: faceUserId(), name:"ledger", displayName:"Debt Tracker"},
+      pubKeyCredParams:[{type:"public-key", alg:-7}, {type:"public-key", alg:-257}],
+      authenticatorSelection:{authenticatorAttachment:"platform", userVerification:"required"},
+      timeout:60000, attestation:"none"
+    }
+  });
+  if(!cred) throw new Error("No credential returned");
+  setFaceLock({enabled:true, credId:b64uEncode(cred.rawId)});
+}
+async function verifyFaceID(lock){
+  await navigator.credentials.get({
+    publicKey:{
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      allowCredentials:[{id:b64uDecode(lock.credId), type:"public-key"}],
+      userVerification:"required",
+      timeout:60000
+    }
+  });
+}
+function syncFaceIDUI(){
+  const toggle = $("faceIdToggle");
+  if(!toggle) return;
+  const enabled = !!getFaceLock();
+  toggle.classList.toggle("on", enabled);
+  toggle.setAttribute("aria-checked", enabled ? "true" : "false");
+}
+let faceBusy = false;                      // a second tap must not stack a second Face ID prompt
+on($("faceIdToggle"), "click", async () => {
+  if(faceBusy) return;
+  faceBusy = true;
+  try{
+    const lock = getFaceLock();
+    if(lock){
+      /* Turning the lock off needs the same proof as unlocking. */
+      try{ await verifyFaceID(lock); }
+      catch(e){ return showError("Face ID didn't verify — lock is still on."); }
+      setFaceLock(null);
+      syncFaceIDUI();
+      return showOk("Face ID turned off.");
+    }
+    if(!(await faceIDSupported())) return showError("Face ID isn't available on this device or browser.");
+    try{
+      await enrollFaceID();
+      syncFaceIDUI();
+      showOk("Face ID enabled.");
+    }catch(e){
+      showError("Couldn't set up Face ID. Try again.");
+    }
+  }finally{ faceBusy = false; }
+});
+faceIDSupported().then(ok => { if(!ok && $("faceIdRow")) $("faceIdRow").style.display = "none"; });
+
+/* Gates the boot itself — resolves once unlocked (or immediately if no lock is set),
+   so nothing above it (state load, rendering) ever runs before Face ID passes. */
+const FACE_MAX_ATTEMPTS = 5, FACE_COOLDOWN_MS = 15 * 60000;
+const FACE_UNTIL_KEY = "debtTrackerFaceUntil_v1";
+/* Panic wipe: erases every local store and reloads to a blank, unlocked app. Runs
+   before Store.init(), so it clears the raw persistence layer directly rather than
+   going through Store — matches iOS's "erase data" after too many failed passcode tries. */
+async function faceIDLogout(){
+  [LS_LEDGER, LS_RCPT, LS_KEY, MIGRATED_KEY, FACE_LOCK_KEY, FACE_FAILS_KEY, FACE_UNTIL_KEY, SETTLED_KEY, LAST_EXPORT_KEY].forEach(k => {
+    try{ localStorage.removeItem(k); }catch(e){}
+  });
+  await new Promise(res => {
+    try{
+      const req = indexedDB.deleteDatabase(DB_NAME);
+      req.onsuccess = req.onerror = req.onblocked = () => res();
+    }catch(e){ res(); }
+  });
+  location.reload();
+}
+function ensureUnlocked(){
+  return new Promise(resolve => {
+    const lock = getFaceLock();
+    const screen = $("lockScreen");
+    if(!lock || screen.classList.contains("open")) return resolve();
+
+    const tile = $("lockTile"), sub = $("lockSub"),
+          retryBtn = $("lockRetryBtn"), cantBtn = $("lockCantBtn"),
+          cantPanel = $("lockCantPanel"), disableBtn = $("lockDisableBtn"),
+          logoutPanel = $("lockLogoutPanel"), logoutBtn = $("lockLogoutBtn");
+    /* Reset the screen — it may be re-shown on resume after an earlier session. */
+    retryBtn.style.display = cantBtn.style.display = "";
+    cantPanel.style.display = logoutPanel.style.display = "none";
+    sub.classList.remove("error");
+    sub.textContent = "Locked with Face ID";
+    screen.classList.add("open");
+    syncLock();
+
+    /* Failed tries are stored, so closing and reopening the app doesn't reset them.
+       Cancelling the Face ID sheet (or letting it time out) is NOT a failed try — iOS
+       already enforces its own Face ID / passcode limits. Too many real failures now
+       means a 15-minute cool-down, never an automatic or one-tap wipe. */
+    let busy = false, fails = parseInt(lsGet(FACE_FAILS_KEY) || "0", 10) || 0;
+    let lockedUntil = parseInt(lsGet(FACE_UNTIL_KEY) || "0", 10) || 0, coolTimer = null;
+    const saveFails = n => { try{ n ? localStorage.setItem(FACE_FAILS_KEY, String(n)) : localStorage.removeItem(FACE_FAILS_KEY); }catch(e){} };
+    const saveUntil = t => { try{ t ? localStorage.setItem(FACE_UNTIL_KEY, String(t)) : localStorage.removeItem(FACE_UNTIL_KEY); }catch(e){} };
+    setAppInert(true);
+    const finish = () => {
+      clearTimeout(coolTimer);
+      saveFails(0); saveUntil(0);
+      screen.classList.remove("open", "cover"); setAppInert(false); syncLock(); resolve();
+    };
+    const endCoolDown = () => {
+      fails = 0; lockedUntil = 0; saveFails(0); saveUntil(0);
+      retryBtn.style.display = cantBtn.style.display = "";
+      logoutPanel.style.display = "none";
+      sub.classList.remove("error");
+      sub.textContent = "Tap below to unlock";
+    };
+    const lockOut = () => {
+      const mins = Math.max(1, Math.ceil((lockedUntil - Date.now()) / 60000));
+      retryBtn.style.display = "none";
+      cantBtn.style.display = "none";
+      cantPanel.style.display = "none";
+      logoutPanel.style.display = "block";
+      $("lockLogoutText").textContent = `Too many failed attempts. Try again in ${mins} minute${mins === 1 ? "" : "s"}, or erase this device's data and restore from a backup.`;
+      sub.classList.add("error");
+      sub.textContent = "Too many failed attempts";
+      clearTimeout(coolTimer);
+      coolTimer = setTimeout(() => Date.now() >= lockedUntil ? endCoolDown() : lockOut(), Math.min(60000, Math.max(1000, lockedUntil - Date.now())));
+    };
+    const cancelled = e => e && (e.name === "NotAllowedError" || e.name === "AbortError");
+    /* `auto` = the attempt fired without a tap. Browsers often refuse WebAuthn without a
+       user gesture, so that refusal must not count either. */
+    const attempt = async auto => {
+      if(busy || Date.now() < lockedUntil) return;
+      busy = true;
+      retryBtn.disabled = true;
+      tile.classList.add("scanning");
+      sub.classList.remove("error");
+      sub.textContent = "Locked with Face ID";
+      try{
+        await verifyFaceID(lock);
+        finish();
+        return;
+      }catch(e){
+        if(auto === true || cancelled(e)){ sub.textContent = "Tap below to unlock"; return; }
+        fails++;
+        saveFails(fails);
+        if(fails >= FACE_MAX_ATTEMPTS){
+          lockedUntil = Date.now() + FACE_COOLDOWN_MS;
+          saveUntil(lockedUntil);
+          lockOut();
+        }else{
+          const left = FACE_MAX_ATTEMPTS - fails;
+          sub.classList.add("error");
+          sub.textContent = `Face ID didn't verify — try again. (${left} attempt${left === 1 ? "" : "s"} left)`;
+        }
+      }finally{
+        busy = false;
+        retryBtn.disabled = false;
+        tile.classList.remove("scanning");
+      }
+    };
+    retryBtn.onclick = () => attempt(false);
+    cantBtn.onclick = () => { cantPanel.style.display = cantPanel.style.display === "block" ? "none" : "block"; };
+    /* Erasing is the only way past the lock without Face ID, so it needs a typed word —
+       someone picking up the phone can't wipe the ledger with a couple of taps. */
+    const gateErase = (input, btn) => {
+      input.value = "";
+      btn.disabled = true;
+      input.oninput = () => { btn.disabled = input.value.trim().toUpperCase() !== "ERASE"; };
+      btn.onclick = () => {
+        if(input.value.trim().toUpperCase() !== "ERASE") return;
+        btn.disabled = true;
+        faceIDLogout();
+      };
+    };
+    gateErase($("lockEraseInput"), disableBtn);
+    gateErase($("lockLogoutInput"), logoutBtn);
+    if(lockedUntil && Date.now() < lockedUntil) lockOut();
+    else{
+      if(lockedUntil) endCoolDown();
+      attempt(true);
+    }
+  });
+}
+
+/* Re-lock after the app has been in the background for a while. Without this the lock
+   only ever applied at a cold start, which on iOS can be days apart. */
+const RELOCK_AFTER_MS = 60000;
+let hiddenAt = 0;
+/* While locked, everything behind the lock screen is made inert, so it can't be reached
+   with the keyboard or a screen reader (e.g. tabbing to Export behind the lock). */
+function setAppInert(v){
+  for(const el of document.body.children){
+    if(el.id === "lockScreen" || el.tagName === "SCRIPT") continue;
+    el.inert = v;
+  }
+}
+on(document, "visibilitychange", () => {
+  const screen = $("lockScreen");
+  if(document.hidden){
+    hiddenAt = Date.now();
+    if(getFaceLock() && !screen.classList.contains("open")) screen.classList.add("cover");
+    return;
+  }
+  const away = hiddenAt ? Date.now() - hiddenAt : 0;
+  hiddenAt = 0;
+  if(getFaceLock() && away > RELOCK_AFTER_MS) ensureUnlocked();
+  screen.classList.remove("cover");
+});
+/* iOS can take the app-switcher snapshot around pagehide as well as visibilitychange —
+   cover on both so balances never end up in the snapshot. */
+on(window, "pagehide", () => {
+  const screen = $("lockScreen");
+  if(getFaceLock() && !screen.classList.contains("open")) screen.classList.add("cover");
+});
+on(window, "pageshow", e => {
+  if(e.persisted && getFaceLock()) ensureUnlocked();
+  else if(!document.hidden) $("lockScreen").classList.remove("cover");
+});
+
+/* ================= Toast ================= */
+const TOAST_ICON = {
+  success: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
+  error: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="13"/><line x1="12" y1="16.5" x2="12.01" y2="16.5"/></svg>'
+};
+const hideToast = () => $("toast").classList.remove("show");
+
+/* One renderer for all three kinds. `action` is optional {label, fn}. */
+function renderToast(msg, kind, action, ms){
+  const t = $("toast");
+  t.className = "toast" + (kind ? " " + kind : "") + (action ? " with-action" : "");
+  t.innerHTML = (TOAST_ICON[kind] || "") + '<span id="toastMsg"></span>'
+    + (action ? '<button type="button" id="toastActionBtn"></button>' : "");
+  $("toastMsg").textContent = msg;
+  if(action){
+    const b = $("toastActionBtn");
+    b.textContent = action.label;
+    b.onclick = () => { hideToast(); action.fn(); };
+  }
+  /* className was just reset, so re-adding .show on the next frame replays the slide-in. */
+  requestAnimationFrame(() => t.classList.add("show"));
+  clearTimeout(t._t);
+  t._t = setTimeout(hideToast, ms);
+}
+const toast = (msg, kind) => renderToast(msg, kind, null, kind === "error" ? 3800 : 2200);
+const showError = (msg, action) => renderToast(msg, "error", action, action ? 6000 : 3800);
+const showOk = msg => toast(msg, "success");
+const toastUndo = (msg, undo) => renderToast(msg, null, {label:"Undo", fn:undo}, UNDO_MS);
+
+on(window, "error", e => showError("Something went wrong: " + ((e && e.message) || "unexpected error")));
+on(window, "unhandledrejection", e => showError("Something went wrong: " + ((e && e.reason && e.reason.message) || "unexpected error")));
+
+/* ================= Lookups ================= */
+const byName = (a, b) => a.name.localeCompare(b.name);
+const peopleSorted = () => [...state.people].sort(byName);
+/* O(1) via the indexes rebuilt in reindex(), with a linear fallback for the window
+   between a mutation and the next refreshAll() — callers can fire either side of it. */
+const findPerson = id => personById.get(id) || state.people.find(p => p.id === id);
+const findTxn = id => txnById.get(id) || state.transactions.find(t => t.id === id);
+
+/* Everything one search box can match for a row: who, note, payment type, amount, a type
+   tag (iowe / owedtome / settlement) and the date in several spellings
+   ("mar", "march", "2026", "2026-03", "2026-03-05", "5 mar"). */
+const MONTH_NAMES = ["january","february","march","april","may","june","july","august","september","october","november","december"];
+function searchBlob(t){
+  const d = new Date(t.txn_date), m = MONTH_NAMES[d.getMonth()], y = d.getFullYear();
+  const iso = toLocalDay(d);
+  const tag = t.settlement ? "settlement settled" : t.type === "i_owe" ? "iowe" : "owedtome";
+  return `${nameOf.get(t.person_id) || ""} ${t.note} ${t.payment_type} ${t.amount.toFixed(2)} ${tag} ${m} ${y} ${iso} ${d.getDate()} ${m.slice(0, 3)}`.toLowerCase();
+}
+/* Query → words that must ALL match. "$", "S$" and thousands commas are dropped so
+   "S$1,200" finds 1200.00; the two type phrases are joined so "i owe" doesn't also
+   match every name containing an "i". */
+function searchTerms(raw){
+  return raw.toLowerCase()
+    .replace(/s?\$/g, "").replace(/(\d),(\d)/g, "$1$2")
+    .replace(/\bi\s+owe\b/g, "iowe").replace(/\bowed\s+to\s+me\b/g, "owedtome").replace(/\bsettle(d|ment|ments)?\b/g, "settle")
+    .split(/\s+/).filter(Boolean);
+}
+
+/* Single pass over transactions builds every number the UI needs. */
+function reindex(){
+  balanceOf = new Map(); txnsOf = new Map(); nameOf = new Map();
+  personById = new Map(); txnById = new Map(); searchText = new Map();
+  totals = {owed:0, iowe:0};
+  state.people.forEach(p => {
+    balanceOf.set(p.id, 0); txnsOf.set(p.id, []); nameOf.set(p.id, p.name);
+    personById.set(p.id, p);
+  });
+
+  sortedTxns = [...state.transactions].sort((a, b) =>
+    a.txn_date < b.txn_date ? 1 : a.txn_date > b.txn_date ? -1 : b.id - a.id);
+
+  sortedTxns.forEach(t => {
+    txnById.set(t.id, t);
+    /* Built once per data change instead of once per row per keystroke — searching
+       is then a plain substring test against a ready-made string. */
+    searchText.set(t.id, searchBlob(t));
+    if(!balanceOf.has(t.person_id)) return;
+    balanceOf.set(t.person_id, round2(balanceOf.get(t.person_id) + signedAmount(t)));
+    txnsOf.get(t.person_id).push(t);
+  });
+  balanceOf.forEach(bal => {
+    if(bal > 0) totals.owed = round2(totals.owed + bal);
+    else if(bal < 0) totals.iowe = round2(totals.iowe - bal);
+  });
+}
+
+/* ================= Render ================= */
+const EDIT_ICON = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
+const TRASH_PATH = '<path d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0"/>';
+const trashIcon = sz => `<svg width="${sz}" height="${sz}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${TRASH_PATH}</svg>`;
+const TRASH_ICON = trashIcon(15), TRASH_ICON_LG = trashIcon(19);
+$("deleteBtn").insertAdjacentHTML("afterbegin", TRASH_ICON);
+$("personDeleteBtn").insertAdjacentHTML("afterbegin", TRASH_ICON);
+$("deleteAllBtn").insertAdjacentHTML("afterbegin", trashIcon(14));
+const SETTLE_ICON = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+function initialsOf(name){
+  const parts = (name || "").trim().split(/\s+/).filter(Boolean);
+  if(!parts.length) return "?";
+  const first = s => [...s][0];              // whole character, so an emoji name isn't cut in half
+  return (first(parts[0]) + (parts.length > 1 ? first(parts[parts.length - 1]) : "")).toUpperCase();
+}
+
+const netBalanceEl = $("netBalance"), netSubEl = $("netSub");
+function renderSummary(){
+  const net = round2(totals.owed - totals.iowe);
+  netBalanceEl.textContent = (net < 0 ? "-" : "") + money(net);
+  netSubEl.textContent = net > 0 ? "Net amount owed to you" : net < 0 ? "Net amount you owe" : "All accounts settled";
+}
+
+const peopleListEl = $("peopleList"), settledToggleEl = $("settledToggle"), settledRowEl = $("settledRow");
+function renderPeople(){
+  const list = peopleListEl;
+  if(settledToggleEl){
+    settledToggleEl.classList.toggle("on", showSettled);
+    settledToggleEl.setAttribute("aria-checked", showSettled ? "true" : "false");
+  }
+  if(!state.people.length){
+    if(settledRowEl) settledRowEl.style.display = "none";   // otherwise lingers after Delete All
+    list.innerHTML = '<div class="empty"><div class="big">No one on the ledger yet</div><div>Tap + to record your first debt.</div></div>';
+    return;
+  }
+  /* A settled person (net zero, with history) drops off this list by default — the
+     "Show settled" toggle above brings them back in, muted, at the bottom.
+     One pass splits the roster instead of filtering it twice. */
+  const active = [], settled = [];
+  for(const p of state.people){
+    (balanceOf.get(p.id) === 0 && txnsOf.get(p.id).length ? settled : active).push(p);
+  }
+  if(settledRowEl) settledRowEl.style.display = settled.length ? "flex" : "none";
+
+  const visible = showSettled ? active.concat(settled) : active;
+  if(!visible.length){
+    list.innerHTML = '<div class="empty"><div class="big">All settled up</div><div>Everyone on your ledger is at net zero.</div></div>';
+    return;
+  }
+  const sorted = visible.sort((a, b) =>
+    (Math.abs(balanceOf.get(b.id)) - Math.abs(balanceOf.get(a.id))) || byName(a, b));
+
+  list.innerHTML = sorted.map(personCardHTML).join("");
+}
+
+/* One person's card, standalone so a row can be re-rendered on its own when only
+   that row changed (open/close) instead of rebuilding the whole list. */
+function personCardHTML(p){
+  const bal = balanceOf.get(p.id), txns = txnsOf.get(p.id), n = txns.length;
+  const cls = bal > 0 ? "pos" : bal < 0 ? "neg" : "zero";
+
+  let html = `<div class="person-card${bal === 0 && n ? " is-settled" : ""}" data-card="${p.id}"><div class="person-row" data-act="person" data-id="${p.id}" role="button" aria-expanded="${openPersonId === p.id}">`
+    + `<div class="person-id-block"><div class="avatar">${esc(initialsOf(p.name))}</div>`
+    + `<div><div class="person-name">${esc(p.name)}</div>`
+    + `<div class="person-meta">${n} transaction${n === 1 ? "" : "s"}</div></div></div>`
+    + `<div class="qa-actions">`
+      + `<button type="button" class="qa-mini" data-act="quickAdd" data-type="owed_to_me" data-id="${p.id}" aria-label="Add: ${esc(p.name)} owes you">+</button>`
+      + `<button type="button" class="qa-mini" data-act="quickAdd" data-type="i_owe" data-id="${p.id}" aria-label="Add: you owe ${esc(p.name)}">−</button>`
+      + (bal !== 0 ? `<button type="button" class="qa-mini" data-act="settleUp" data-id="${p.id}" aria-label="Settle up with ${esc(p.name)}">${SETTLE_ICON}</button>` : "")
+    + `</div>`
+    + `<div class="balance ${cls}">${bal !== 0 || !n ? money(bal) : "Settled"}</div></div>`;
+
+  if(openPersonId === p.id){
+    html += '<div class="person-detail">'
+      + (n ? txns.map(t => txnRow(t, false)).join("") : '<div class="txn-note">No transactions yet.</div>')
+      + '</div>';
+  }
+  return html + '</div>';
+}
+
+/* Repaints only the named cards. Card order depends on balance, which these
+   interactions never change, so nothing needs re-sorting. */
+function refreshPersonCards(...ids){
+  for(const id of new Set(ids)){
+    if(id == null) continue;
+    const el = peopleListEl.querySelector(`[data-card="${id}"]`);
+    const p = findPerson(id);
+    if(el && p) el.outerHTML = personCardHTML(p);
+  }
+}
+
+function txnRow(t, showPerson){
+  const credit = t.type === "owed_to_me";
+  const label = t.settlement ? "Settlement" : TYPE_LABELS[t.type];
+  return `<div class="swipe-wrap" data-id="${t.id}">`
+    + `<div class="swipe-delete-bg" data-act="swipedelete" data-id="${t.id}" role="button" aria-label="Delete transaction"><span class="swipe-delete-icon">${TRASH_ICON_LG}</span></div>`
+    + `<div class="txn swipe-content" data-act="txn" data-id="${t.id}" role="button"><div class="txn-left">`
+      + `<div class="txn-type">${label}</div>`
+      + (showPerson ? `<div class="txn-person">${esc(nameOf.get(t.person_id) || "—")}</div>` : "")
+      + (t.note ? `<div class="txn-note">${esc(t.note)}</div>` : "")
+      + `<div class="txn-meta"><div class="txn-date">${fmtDateTime(t.txn_date)}</div>`
+      + (t.payment_type ? `<div class="txn-method">${esc(t.payment_type)}</div>` : "")
+      + (t.receipt ? `<div class="txn-receipt-badge" data-act="receipt" data-id="${t.id}" role="button">📎 Receipt</div>` : "")
+      + `</div></div><div class="txn-right">`
+      + `<div class="txn-amt ${credit ? "" : "debit"}">${credit ? "+" : "-"}${money(t.amount)}</div>`
+      + (t.edited ? `<div class="txn-edited">Edited ${t.edited_at ? fmtDateTime(t.edited_at) : ""}</div>` : "")
+    + `</div></div></div>`;
+}
+
+const fSearchEl = $("fSearch"), historyListEl = $("historyList");
+
+/* Newest first, filtered only by the search box. */
+function renderHistory(){
+  const terms = searchTerms(fSearchEl.value);
+  const displayRows = terms.length
+    ? sortedTxns.filter(t => { const b = searchText.get(t.id) || ""; return terms.every(w => b.includes(w)); })
+    : sortedTxns;
+
+  /* Rendered in pages: a multi-year ledger used to put thousands of rows in the DOM at once. */
+  const shown = displayRows.slice(0, historyLimit), more = displayRows.length - shown.length;
+  historyListEl.innerHTML = displayRows.length
+    ? '<div class="person-card">' + shown.map(t => txnRow(t, true)).join("") + '</div>'
+      + (more > 0 ? `<button type="button" class="btn btn-secondary" id="historyMoreBtn" style="width:100%;margin-top:12px;">Show ${Math.min(more, HISTORY_PAGE)} more (${more} left)</button>` : "")
+    : terms.length
+      ? '<div class="empty"><div class="big">No matching transactions</div><div>Try a different search.</div></div>'
+      : '<div class="empty"><div class="big">No transactions yet</div><div>Tap + to record your first debt.</div></div>';
+}
+const HISTORY_PAGE = 150;
+let historyLimit = HISTORY_PAGE;
+/* A new search starts again from the first page. */
+const renderHistoryFresh = () => { historyLimit = HISTORY_PAGE; renderHistory(); };
+on(historyListEl, "click", e => {
+  if(!elOf(e.target)?.closest("#historyMoreBtn")) return;
+  historyLimit += HISTORY_PAGE;
+  renderHistory();
+});
+
+/* Deferred to the next frame so a sheet's close animation (transform/opacity, cheap on
+   the compositor) gets an uncontested first frame instead of racing a full reindex +
+   innerHTML rebuild on the same tick — that's what caused the visible stutter.
+   Only the visible tab is rebuilt; the other is flagged and rebuilt when shown. */
+const tabDirty = {overview:false, history:false};
+let refreshQueued = false;
+function refreshAll(){
+  /* Several mutations in one tick (save + new person + new method) now cost one rebuild. */
+  if(refreshQueued) return;
+  refreshQueued = true;
+  requestAnimationFrame(() => {
+    refreshQueued = false;
+    reindex();
+    renderSummary();
+    if(currentTab === "overview"){
+      renderPeople(); tabDirty.overview = false; tabDirty.history = true;
+    }else{
+      renderHistory(); tabDirty.history = false; tabDirty.overview = true;
+    }
+  });
+}
+
+/* ================= Overlays ================= */
+const overlay = $("overlay"), personOverlay = $("personOverlay"), confirmOverlay = $("confirmOverlay"),
+      backupOverlay = $("backupOverlay"), settingsOverlay = $("settingsOverlay"),
+      paymentTypesOverlay = $("paymentTypesOverlay"), managePeopleOverlay = $("managePeopleOverlay"),
+      lightbox = $("lightbox"), settleOverlay = $("settleOverlay"),
+      deleteAllOverlay = $("deleteAllOverlay");
+
+/* Scroll lock is derived from what's actually open — stacked sheets used to unlock the body early.
+   Includes .closing so the background stays locked through the close animation, not just the cut. */
+/* While a sheet is up, the page behind it is made inert so VoiceOver can't wander
+   off the sheet onto the list underneath. The lock screen keeps it inert too. */
+const appEl = document.querySelector(".app"), fabEl = $("fabBtn");
+const syncLock = () => {
+  const anyOpen = !!document.querySelector(".overlay.open, .overlay.closing, .lightbox.open, .lock-screen.open");
+  document.body.classList.toggle("locked", anyOpen);
+  const behind = anyOpen || $("lockScreen").classList.contains("open");
+  appEl.inert = behind; fabEl.inert = behind;
+};
+/* Every sheet is announced by its own heading. */
+document.querySelectorAll(".sheet").forEach((sh, i) => {
+  const h = sh.querySelector("h2");
+  if(!h) return;
+  if(!h.id) h.id = "sheetHeading" + i;
+  sh.setAttribute("aria-labelledby", h.id);
+});
+const openOverlay = o => {
+  clearTimeout(o._closeT);
+  if(o._onEnd){ o.removeEventListener("animationend", o._onEnd); o._onEnd = null; }
+  o.classList.remove("closing"); o.classList.add("open"); syncLock();
+  const sh = o.querySelector(".sheet");
+  if(sh) sh.scrollTop = 0;                       // never reopen half-scrolled from last time
+  /* Opening a sheet never brings up the keyboard: drop any focus, and ignore taps on the
+     sheet while it slides up so the tap that opened it can't land on the amount box. */
+  if(document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  o.classList.add("opening");
+  clearTimeout(o._openT);
+  o._openT = setTimeout(() => o.classList.remove("opening"), 300);
+};
+/* Animates out (scrim fade + sheet slide-down, like iOS) instead of cutting straight to
+   display:none. The overlay's own animationend (not the sheet's, which bubbles too) is
+   what removes .closing once the transition actually finishes. */
+const closeOverlay = o => {
+  if(!o.classList.contains("open")) return;
+  /* Drop the keyboard with the sheet — iOS can leave it up over the list otherwise. */
+  if(o.contains(document.activeElement)) document.activeElement.blur();
+  o.classList.remove("open");
+  o.classList.add("closing");
+  syncLock();
+  clearTimeout(o._closeT);
+  if(o._onEnd) o.removeEventListener("animationend", o._onEnd);
+  const done = () => {
+    clearTimeout(o._closeT);
+    o.removeEventListener("animationend", o._onEnd);
+    o._onEnd = null;
+    if(o.classList.contains("open")) return;     // re-opened meanwhile — leave it alone
+    o.classList.remove("closing");
+    syncLock();
+  };
+  o._onEnd = e => { if(e.target === o) done(); };
+  o.addEventListener("animationend", o._onEnd);
+  /* animationend never fires in a background tab — without this the overlay stayed
+     .closing and the page stayed scroll-locked. */
+  o._closeT = setTimeout(done, 400);
+};
+const isOpen = o => o.classList.contains("open");
+/* The password never lingers: a stale one would silently encrypt the next export. */
+function closeBackup(){ closeOverlay(backupOverlay); $("backupPassword").value = ""; }
+
+let pendingConfirm = null, pendingAlt = null;
+/* alt = {label, fn} renders a second, non-destructive choice beside the primary one. */
+function appConfirm(msg, action, yesLabel, alt, title){
+  $("confirmTitle").textContent = title || "Are you sure?";
+  $("confirmMsg").textContent = msg;
+  $("confirmYesBtn").textContent = yesLabel || "Delete";
+  $("confirmAltBtn").textContent = alt ? alt.label : "";
+  $("confirmAltBtn").style.display = alt ? "block" : "none";
+  pendingConfirm = action;
+  pendingAlt = alt ? alt.fn : null;
+  openOverlay(confirmOverlay);
+}
+function cancelConfirm(){ pendingConfirm = pendingAlt = null; closeOverlay(confirmOverlay); }
+
+on($("confirmNoBtn"), "click", cancelConfirm);
+on($("confirmYesBtn"), "click", () => {
+  const a = pendingConfirm;
+  pendingConfirm = pendingAlt = null;
+  closeOverlay(confirmOverlay);
+  if(a) a();
+});
+on($("confirmAltBtn"), "click", () => {
+  const a = pendingAlt;
+  pendingConfirm = pendingAlt = null;
+  closeOverlay(confirmOverlay);
+  if(a) a();
+});
+
+/* Tapping the backdrop closes that layer through its own cleanup function. */
+const SHEET_LAYERS = [[overlay, closeSheet], [personOverlay, closePersonSheet], [confirmOverlay, cancelConfirm],
+ [backupOverlay, closeBackup],
+ [settingsOverlay, () => closeOverlay(settingsOverlay)],
+ [paymentTypesOverlay, () => closeOverlay(paymentTypesOverlay)],
+ [managePeopleOverlay, () => closeOverlay(managePeopleOverlay)],
+ [settleOverlay, closeSettleSheet], [deleteAllOverlay, closeDeleteAll]];
+/* While a sheet is still opening, taps on it fall through to the backdrop — ignore them,
+   so the tap that opened a sheet (or an early tap on it) can't also dismiss it. */
+SHEET_LAYERS.forEach(([o, close]) => on(o, "click", e => {
+  if(e.target !== o || o.classList.contains("opening")) return;
+  close();
+}));
+
+/* ================= Receipts =================
+   Photos are Blobs in their own store. The UI only ever sees a URL, resolved lazily
+   and cached, so lists render without touching the database. */
+const urlCache = new Map();                       // txn id -> object URL (or data URL in fallback mode)
+let rcpt = {mode:"none", blob:null, url:null, temp:false};   // receipt state for the open sheet
+
+async function receiptURL(id){
+  if(urlCache.has(id)) return urlCache.get(id);
+  const v = await Store.getReceipt(id);
+  if(!v) return null;
+  const url = typeof v === "string" ? v : URL.createObjectURL(v);
+  urlCache.set(id, url);
+  return url;
+}
+function dropReceiptURL(id){
+  const u = urlCache.get(id);
+  if(u && u.startsWith("blob:")) URL.revokeObjectURL(u);
+  urlCache.delete(id);
+}
+function releaseTemp(){
+  if(rcpt.temp && rcpt.url) URL.revokeObjectURL(rcpt.url);
+}
+function setRcpt(next){
+  releaseTemp();
+  rcpt = Object.assign({mode:"none", blob:null, url:null, temp:false}, next);
+  const row = $("receiptRow");
+  if(rcpt.url){
+    row.innerHTML = `<img class="receipt-thumb" id="receiptThumb" src="${esc(rcpt.url)}" alt="Receipt preview">`
+      + '<div><div class="receipt-status">Attached</div>'
+      + '<button type="button" class="receipt-remove" id="receiptRemoveBtn">Remove</button></div>';
+    on($("receiptThumb"), "click", () => openLightbox(rcpt.url));
+    on($("receiptRemoveBtn"), "click", () => setRcpt(null));
+  }else if(rcpt.mode === "keep"){
+    row.innerHTML = '<div class="receipt-status">Loading receipt…</div>';
+  }else{
+    row.innerHTML = '<button type="button" class="receipt-add-btn" id="receiptAddBtn">+ Attach photo</button>';
+    on($("receiptAddBtn"), "click", () => $("receiptFile").click());
+  }
+}
+
+/* Canvas -> Blob keeps the photo binary; base64 was 33% bigger for no reason. */
+function compressImage(file, cb){
+  const reader = new FileReader();
+  reader.onload = e => {
+    const img = new Image();
+    img.onload = () => {
+      const max = 1100, scale = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * scale) || 1;
+      c.height = Math.round(img.height * scale) || 1;
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      try{ c.toBlob(b => cb(b || null), "image/jpeg", 0.72); }catch(err){ cb(null); }
+    };
+    img.onerror = () => cb(null);
+    img.src = e.target.result;
+  };
+  reader.onerror = () => cb(null);
+  reader.readAsDataURL(file);
+}
+
+const openLightbox = src => { $("lightboxImg").src = src; lightbox.classList.add("open"); syncLock(); };
+const closeLightbox = () => { lightbox.classList.remove("open"); $("lightboxImg").src = ""; syncLock(); };
+
+/* ================= Transaction sheet ================= */
+const personSelect = $("personSelect"), newPersonName = $("newPersonName"),
+      methodSelect = $("methodSelect"), newMethodName = $("newMethodName"),
+      dateInput = $("dateInput"), typeGrid = $("typeGrid"), amountInput = $("amountInput");
+
+const setErr = msg => showErrIn("formErr", msg);
+
+/* Cents-first entry keeps decimals exact: typing "500" gives 5.00. */
+function setAmountCents(c){
+  amountCents = clamp(Math.floor(Number(c) || 0), 0, MAX_CENTS);
+  amountInput.value = amountCents === 0 ? "" : (amountCents / 100).toFixed(2);
+}
+function setTxnDate(d){
+  txnDate = validDate(d) ? d : new Date();
+  dateInput.value = toLocalInput(txnDate);
+  dateInput.max = toLocalInput(new Date());
+}
+
+function populatePersonSelect(selectedId){
+  personSelect.innerHTML = (state.people.length ? '<option value="">Select person…</option>' : "")
+    + peopleSorted().map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")
+    + '<option value="__new__">+ Add new person</option>';
+  personSelect.value = selectedId != null ? String(selectedId) : (state.people.length ? "" : "__new__");
+  newPersonName.style.display = personSelect.value === "__new__" ? "block" : "none";
+}
+function populateMethodSelect(selected){
+  const methods = [...state.paymentTypes].sort((a, b) => a.localeCompare(b));
+  if(selected && !methods.includes(selected)) methods.push(selected);
+  methodSelect.innerHTML = '<option value="__none__">Not specified</option>'
+    + methods.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join("")
+    + '<option value="__new__">+ Add new payment type</option>';
+  methodSelect.value = selected || "__none__";
+  newMethodName.style.display = "none";
+  newMethodName.value = "";
+}
+function setTypeUI(type, locked){
+  selectedType = type || null;
+  typeGrid.classList.toggle("locked", !!locked);
+  [...typeGrid.children].forEach(o => o.classList.toggle("selected", !!type && o.dataset.type === type));
+  $("typeHint").textContent = type ? (TYPE_HINTS[type] || "") : "";
+}
+
+function openAdd(){
+  editingTxnId = null;
+  setErr("");
+  $("sheetTitle").textContent = "Add Debt";
+  $("deleteBtn").style.display = "none";
+  personSelect.disabled = false;
+  newPersonName.value = "";
+  populatePersonSelect(null);
+  setTypeUI(null, false);
+  setAmountCents(0);
+  $("noteInput").value = "";
+  setRcpt(null);
+  setTxnDate(new Date());
+  dateInput.disabled = false;
+  $("dateLockNote").textContent = "Set once — locked after the debt is created.";
+  populateMethodSelect(null);
+  openOverlay(overlay);
+}
+
+/* Skips the person picker: fired from the + / − buttons on a person row, so the
+   sheet opens straight to amount entry with that person and a starting type set. */
+function openQuickAdd(personId, type){
+  const p = findPerson(personId);
+  if(!p) return;
+  openAdd();
+  populatePersonSelect(personId);
+  personSelect.value = String(personId);
+  personSelect.disabled = true;
+  newPersonName.style.display = "none";
+  setTypeUI(type === "i_owe" ? "i_owe" : "owed_to_me", false);
+  /* No auto-focus: the keypad only opens when the user taps the amount box. */
+}
+
+function openEdit(id){
+  const t = findTxn(id);
+  if(!t) return showError("That transaction no longer exists.");
+  editingTxnId = id;
+  setErr("");
+  $("sheetTitle").textContent = t.settlement ? "Edit Settlement" : "Edit Debt";
+  $("deleteBtn").style.display = "";
+  populatePersonSelect(t.person_id);
+  personSelect.disabled = true;
+  newPersonName.style.display = "none";
+  setTypeUI(t.type, true);
+  if(t.settlement) $("typeHint").textContent = t.type === "i_owe" ? "This person paid you back this amount." : "You paid this person back this amount.";
+  setAmountCents(Math.round(t.amount * 100));
+  $("noteInput").value = t.note || "";
+  /* "keep" from the start: if Save is tapped before the photo has loaded, the
+     receipt must survive — previously the sheet read as "no receipt" and deleted it. */
+  setRcpt(t.receipt ? {mode:"keep"} : null);
+  setTxnDate(new Date(t.txn_date));
+  dateInput.disabled = true;
+  $("dateLockNote").textContent = "Locked — date and time cannot be changed.";
+  populateMethodSelect(t.payment_type || null);
+  openOverlay(overlay);
+  /* Photo loads after the sheet is up; the sheet must not wait on the database. */
+  if(t.receipt){
+    receiptURL(id).catch(() => null).then(url => {
+      if(editingTxnId !== id || rcpt.mode !== "keep") return;   // user replaced/removed it meanwhile
+      setRcpt(url ? {mode:"keep", url} : {mode:"missing"});
+    });
+  }
+}
+function closeSheet(){ releaseTemp(); rcpt = {mode:"none", blob:null, url:null, temp:false}; closeOverlay(overlay); editingTxnId = null; setErr(""); }
+
+/* ================= Settle up (full or partial) =================
+   Records a payment against a person's balance as an ordinary transaction (so all the
+   existing balance math, history, undo, and backup logic just works), tagged `settlement:1`
+   purely for display — it always moves the balance toward zero, in whichever direction
+   the current balance needs, and is capped so it can never overshoot past zero. */
+let settlePersonId = null, settleDate = new Date(), settleAmountCents = 0, settleMaxCents = 0;
+const settleAmountInput = $("settleAmountInput"), settleDateInput = $("settleDateInput"),
+      settleMethodSelect = $("settleMethodSelect");
+const setSettleErr = msg => showErrIn("settleErr", msg);
+
+function setSettleAmountCents(c){
+  settleAmountCents = clamp(Math.floor(Number(c) || 0), 0, settleMaxCents);
+  settleAmountInput.value = settleAmountCents === 0 ? "" : (settleAmountCents / 100).toFixed(2);
+}
+function setSettleDate(d){
+  settleDate = validDate(d) ? d : new Date();
+  settleDateInput.value = toLocalInput(settleDate);
+  settleDateInput.max = toLocalInput(new Date());
+}
+function populateSettleMethodSelect(){
+  const methods = [...state.paymentTypes].sort((a, b) => a.localeCompare(b));
+  settleMethodSelect.innerHTML = '<option value="__none__">Not specified</option>'
+    + methods.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join("");
+  settleMethodSelect.value = "__none__";
+}
+function openSettle(personId){
+  const p = findPerson(personId);
+  const bal = balanceNow(personId);
+  if(!p || bal === 0) return;
+  settlePersonId = personId;
+  settleMaxCents = Math.round(Math.abs(bal) * 100);
+  setSettleErr("");
+  $("settleTitle").textContent = `Settle with ${p.name}`;
+  $("settleDesc").textContent = bal > 0
+    ? `${p.name} owes you ${money(bal)}. Record what they've paid back — in full, or part of it.`
+    : `You owe ${p.name} ${money(bal)}. Record what you've paid back — in full, or part of it.`;
+  setSettleAmountCents(settleMaxCents);       // most settle-ups are in full; edit for part
+  populateSettleMethodSelect();
+  $("settleNoteInput").value = "";
+  setSettleDate(new Date());
+  openOverlay(settleOverlay);
+}
+function closeSettleSheet(){ closeOverlay(settleOverlay); settlePersonId = null; setSettleErr(""); }
+
+on($("settleCancelBtn"), "click", closeSettleSheet);
+on($("settleMaxBtn"), "click", () => setSettleAmountCents(settleMaxCents));
+/* Native iPhone date & time picker. An emptied field snaps back to the last valid value. */
+const wireDate = (input, get, set) => on(input, "change", () => {
+  const d = new Date(input.value);
+  set(validDate(d) ? d : get());
+});
+wireDate(settleDateInput, () => settleDate, setSettleDate);
+/* Live balance straight from state. balanceOf is only rebuilt on the next frame, so a
+   quick second tap used to see the old balance and record a second settlement. */
+const balanceNow = id => state.transactions.reduce((s, t) => t.person_id === id ? round2(s + signedAmount(t)) : s, 0);
+
+on($("settleSaveBtn"), "click", () => {
+  if(!isOpen(settleOverlay)) return;               // already submitted, sheet is closing
+  const amount = round2(settleAmountCents / 100);
+  const p = findPerson(settlePersonId);
+  const bal = settlePersonId != null ? balanceNow(settlePersonId) : 0;
+  if(!p || bal === 0) return setSettleErr("That balance is already settled.");
+  if(!(amount > 0)) return setSettleErr("Enter an amount greater than zero.");
+  if(isFuture(settleDate)) return setSettleErr("The date can't be in the future.");
+  if(amount > round2(Math.abs(bal)) + 0.001) return setSettleErr(`Can't settle more than ${money(bal)} owed.`);
+
+  const method = settleMethodSelect.value === "__none__" ? "" : settleMethodSelect.value;
+  const note = $("settleNoteInput").value.trim();
+  const full = amount >= round2(Math.abs(bal)) - 0.001;
+
+  try{
+    const t = {
+      id: state.nextTxnId++, person_id: settlePersonId, type: bal > 0 ? "i_owe" : "owed_to_me", amount,
+      payment_type: method, note,
+      txn_date: settleDate.toISOString(), created_at: new Date().toISOString(),
+      edited: 0, edited_at: null, receipt: 0, settlement: 1
+    };
+    state.transactions.push(t);
+    persist(); closeSettleSheet(); refreshAll();
+    showOk(full ? "Settled in full." : `${money(amount)} settled.`);
+  }catch(e){ onStorageError(e); }
+});
+
+/* Only commits a brand-new payment type once the rest of the form has validated. */
+function resolveMethod(){
+  if(methodSelect.value === "__none__") return "";
+  if(methodSelect.value !== "__new__") return methodSelect.value;
+  const name = newMethodName.value.trim();
+  /* "paynow" reuses the existing "PayNow" instead of creating a look-alike. */
+  const existing = state.paymentTypes.find(m => m.toLowerCase() === name.toLowerCase());
+  if(existing) return existing;
+  if(name) state.paymentTypes.push(name);
+  return name;
+}
+
+/* Writes the sheet's receipt state onto a saved transaction. Returns true if it changed. */
+async function commitReceipt(t){
+  const had = !!t.receipt;
+  if(rcpt.mode === "new"){
+    await Store.putReceipt(t.id, rcpt.blob);
+    dropReceiptURL(t.id);
+    t.receipt = 1;
+    return true;
+  }
+  if(rcpt.mode === "missing"){ t.receipt = 0; return false; }   // flag pointed at a photo that isn't stored
+  if(rcpt.mode === "none" && had){
+    await Store.delReceipt(t.id);
+    dropReceiptURL(t.id);
+    t.receipt = 0;
+    return true;
+  }
+  return false;
+}
+
+let saving = false;
+on($("saveBtn"), "click", async () => {
+  if(saving || !isOpen(overlay)) return;           // double-tap guard: the handler awaits storage
+  saving = true;
+  try{ await saveTxn(); }finally{ saving = false; }
+});
+async function saveTxn(){
+  const amount = round2(amountCents / 100);
+  const note = $("noteInput").value.trim();
+  if(!selectedType) return setErr("Choose a transaction type.");
+  if(!(amount > 0)) return setErr("Enter an amount greater than zero.");
+  if(methodSelect.value === "__new__" && !newMethodName.value.trim()) return setErr("Enter the new payment type name.");
+
+  try{
+    if(editingTxnId){
+      const t = findTxn(editingTxnId);
+      if(!t){ closeSheet(); refreshAll(); return showError("That transaction no longer exists."); }
+      /* A settlement only ever pays a balance down to zero — editing it can't overshoot. */
+      if(t.settlement && amount !== t.amount){
+        const rest = round2(balanceNow(t.person_id) - signedAmount(t));   // balance without this payment
+        const room = round2(t.type === "i_owe" ? Math.max(rest, 0) : Math.max(-rest, 0));
+        if(amount > room + 0.001) return setErr(room > 0 ? `A settlement can't be more than ${money(room)}.` : "There's nothing left for this settlement to pay off.");
+      }
+      const method = resolveMethod();
+      const changed = t.amount !== amount || t.note !== note || t.payment_type !== method;
+      const rcptChanged = await commitReceipt(t);
+      /* Only flag as edited when something actually changed. */
+      if(changed || rcptChanged){
+        t.edited = 1;
+        t.edited_at = new Date().toISOString();
+      }
+      Object.assign(t, {amount, note, payment_type:method});
+      persist(); closeSheet(); refreshAll(); showOk("Saved.");
+      return;
+    }
+
+    if(!validDate(txnDate)) return setErr("Choose a date and time.");
+    if(isFuture(txnDate)) return setErr("The date can't be in the future.");
+
+    let personId, newPerson = null;
+    if(personSelect.value === "__new__"){
+      const name = newPersonName.value.trim();
+      if(!name) return setErr("Enter a name for the new person.");
+      const dupe = state.people.find(p => p.name.toLowerCase() === name.toLowerCase());
+      if(dupe) personId = dupe.id;
+      else{
+        personId = state.nextPersonId;
+        newPerson = {id:personId, name};
+      }
+    }else{
+      personId = parseInt(personSelect.value, 10);
+      if(isNaN(personId) || !findPerson(personId)) return setErr("Choose a person.");
+    }
+
+    /* Nothing touches the ledger until the photo has stored: if it fails, the sheet
+       stays open with no half-added entry, so tapping Save again can't duplicate it. */
+    const t = {
+      id: state.nextTxnId, person_id: personId, type: selectedType, amount,
+      payment_type: "", note, txn_date: txnDate.toISOString(),
+      created_at: new Date().toISOString(), edited: 0, edited_at: null, receipt: 0
+    };
+    await commitReceipt(t);
+    state.nextTxnId++;
+    if(newPerson){ state.nextPersonId++; state.people.push(newPerson); }
+    t.payment_type = resolveMethod();
+    state.transactions.push(t);
+    persist(); closeSheet(); refreshAll(); showOk("Debt added.");
+  }catch(e){ onStorageError(e); }
+}
+
+/* ===== Deletion with undo =====
+   A deleted transaction leaves `state` at once, but its photo is held back until the
+   undo window closes — otherwise Undo would restore a row with a missing receipt.
+   Anything still pending is committed on the next delete, on page hide, and swept at boot. */
+function purgeReceipts(txns){
+  const ids = txns.filter(t => t.receipt).map(t => t.id);
+  if(!ids.length) return;
+  ids.forEach(dropReceiptURL);
+  Store.delReceipt(ids).catch(() => {});
+}
+function removeTxns(ids){
+  const set = new Set(ids);
+  const removed = state.transactions.filter(t => set.has(t.id));
+  state.transactions = state.transactions.filter(t => !set.has(t.id));
+  persist();
+  return removed;
+}
+
+let trash = null;
+function commitTrash(){
+  if(!trash) return;
+  clearTimeout(trash.timer);
+  purgeReceipts(trash.txns);
+  trash = null;
+}
+function deleteWithUndo(ids, msg){
+  commitTrash();
+  const removed = removeTxns(ids);
+  if(!removed.length) return;
+  trash = {txns:removed, timer:setTimeout(commitTrash, UNDO_MS + 500)};
+  refreshAll();
+  toastUndo(msg, () => {
+    if(!trash) return;
+    clearTimeout(trash.timer);
+    state.transactions.push(...trash.txns);
+    trash = null;
+    persist(); refreshAll();
+    showOk("Restored.");
+  });
+}
+
+on($("deleteBtn"), "click", () => {
+  const gone = editingTxnId;
+  if(!gone) return;
+  /* No "are you sure" — the toast's Undo is the safety net. */
+  closeSheet();
+  deleteWithUndo([gone], "Transaction deleted.");
+});
+
+wireDate(dateInput, () => txnDate, setTxnDate);
+
+/* ================= Person profile sheet ================= */
+const setPersonErr = msg => showErrIn("personErr", msg);
+
+function openPersonSheet(id){
+  editingPersonId = null;
+  setPersonErr("");
+  const p = id != null ? findPerson(id) : null;
+  if(id != null && !p) return showError("That person no longer exists.");
+
+  if(p){
+    editingPersonId = p.id;
+    const bal = balanceOf.get(p.id) || 0, n = (txnsOf.get(p.id) || []).length;
+    $("personSheetTitle").textContent = "Edit Person";
+    $("personStats").textContent = `${n} transaction${n === 1 ? "" : "s"} · `
+      + (bal > 0 ? money(bal) + " owed to you" : bal < 0 ? "you owe " + money(bal) : "settled");
+    $("personDeleteBtn").style.display = "";
+    $("pName").value = p.name;
+  }else{
+    $("personSheetTitle").textContent = "Add Person";
+    $("personStats").textContent = "Add someone now and log debts against them later.";
+    $("personDeleteBtn").style.display = "none";
+    $("pName").value = "";
+  }
+  openOverlay(personOverlay);
+}
+let personFromManage = false;
+function closePersonSheet(){
+  closeOverlay(personOverlay); editingPersonId = null; setPersonErr("");
+  if(personFromManage){ personFromManage = false; renderManagePeopleList(); openOverlay(managePeopleOverlay); }
+}
+
+on($("personSaveBtn"), "click", () => {
+  if(!isOpen(personOverlay)) return;               // already saved, sheet is closing
+  const name = $("pName").value.trim();
+  if(!name) return setPersonErr("Enter a name.");
+  if(state.people.some(p => p.id !== editingPersonId && p.name.toLowerCase() === name.toLowerCase()))
+    return setPersonErr("Someone with that name already exists.");
+
+  if(editingPersonId){
+    const p = findPerson(editingPersonId);
+    if(!p){ closePersonSheet(); refreshAll(); return showError("That person no longer exists."); }
+    p.name = name;
+  }else{
+    const id = state.nextPersonId++;
+    state.people.push({id, name});
+    openPersonId = id;
+  }
+  persist(); reindex(); closePersonSheet(); refreshAll();
+  showOk("Saved.");
+});
+
+function removePerson(id){
+  commitTrash();                       /* a pending undo could restore a row pointing at this person */
+  const p = findPerson(id);
+  /* From state, not txnsOf: an entry added this frame isn't indexed yet and would be orphaned. */
+  const ids = state.transactions.filter(t => t.person_id === id).map(t => t.id);
+  state.people = state.people.filter(x => x.id !== id);
+  purgeReceipts(removeTxns(ids));
+  if(openPersonId === id) openPersonId = null;
+  refreshAll();
+  toast(p ? `${p.name} deleted.` : "Person deleted.");
+}
+const deleteMsg = (id, quoteName) => {
+  const n = (txnsOf.get(id) || []).length, p = findPerson(id);
+  const who = quoteName && p ? `\u201c${p.name}\u201d` : "this person";
+  return n ? `Delete ${who} and ${n} transaction${n === 1 ? "" : "s"}? This cannot be undone.` : `Delete ${who}?`;
+};
+
+on($("personDeleteBtn"), "click", () => {
+  const id = editingPersonId;
+  if(id == null) return;
+  appConfirm(deleteMsg(id, false), () => {
+    removePerson(id);
+    reindex();
+    closePersonSheet();
+  });
+});
+on($("personCancelBtn"), "click", closePersonSheet);
+on($("addPersonBtn"), "click", () => { closeOverlay(managePeopleOverlay); personFromManage = true; openPersonSheet(null); });
+
+/* ================= Manage People ================= */
+function renderManagePeopleList(){
+  const list = $("managePeopleList");
+  if(!state.people.length){ list.innerHTML = '<div class="txn-note">No one on the ledger yet.</div>'; return; }
+  list.innerHTML = peopleSorted().map(p => {
+    const bal = balanceOf.get(p.id) || 0;
+    const balTxt = bal === 0 ? "Settled" : (bal > 0 ? "+" : "-") + money(bal);
+    return `<div class="pt-row" data-id="${p.id}">`
+      + `<div class="pt-name">${esc(p.name)} <span style="color:var(--dim);font-weight:400;">(${balTxt})</span></div>`
+      + `<button type="button" class="pt-icon-btn" data-act="managePersonEdit" aria-label="Edit">${EDIT_ICON}</button>`
+      + `<button type="button" class="pt-icon-btn danger" data-act="managePersonDelete" aria-label="Delete">${TRASH_ICON}</button>`
+      + `</div>`;
+  }).join("");
+}
+
+on($("managePeopleList"), "click", e => {
+  const btn = elOf(e.target)?.closest("button[data-act]");
+  if(!btn) return;
+  const id = parseInt(btn.closest(".pt-row").dataset.id, 10);
+  if(isNaN(id)) return;
+  if(btn.dataset.act === "managePersonEdit"){
+    closeOverlay(managePeopleOverlay);
+    personFromManage = true;
+    openPersonSheet(id);
+  }else{
+    appConfirm(deleteMsg(id, true), () => { removePerson(id); renderManagePeopleList(); });
+  }
+});
+
+on($("managePeopleBtn"), "click", () => {
+  renderManagePeopleList();
+  closeOverlay(settingsOverlay);
+  openOverlay(managePeopleOverlay);
+});
+on($("managePeopleCloseBtn"), "click", () => closeOverlay(managePeopleOverlay));
+
+/* ================= Swipe to delete ================= */
+const swipe = {content:null, wrap:null, icon:null, startX:0, startY:0, baseX:0, dragging:false, axis:null, openWrap:null, tx:0};
+const SWIPE_ICON_W = 19;
+/* The icon is repositioned from the very same `tx` value that drives the row's own
+   translateX, in the same tick — so it can never fall out of step with the reveal.
+   It's centred within whatever width is currently exposed (clamped to the resting
+   width), so it tracks the red box the whole way instead of just sitting in its
+   final spot and waiting to be uncovered. */
+function positionSwipeIcon(icon, tx){
+  if(!icon) return;
+  const revealed = clamp(Math.abs(tx), 0, Math.abs(SWIPE_OPEN));
+  icon.style.right = `${(revealed - SWIPE_ICON_W) / 2}px`;
+}
+
+function closeSwipe(){
+  if(!swipe.openWrap) return;
+  const c = swipe.openWrap.querySelector(".swipe-content");
+  const icon = swipe.openWrap.querySelector(".swipe-delete-icon");
+  if(c){ c.style.transition = "transform .18s ease"; c.style.transform = "translateX(0)"; }
+  if(icon){ icon.style.transition = "right .18s ease"; positionSwipeIcon(icon, 0); }
+  swipe.openWrap = null;
+}
+function commitSwipeDelete(wrap){
+  const id = parseInt(wrap.dataset.id, 10);
+  const c = wrap.querySelector(".swipe-content");
+  /* A second tap on the red panel used to run deleteWithUndo twice — the second call
+     committed the first one's trash, so Undo silently did nothing. */
+  if(isNaN(id) || !c || wrap.dataset.deleting) return;
+  wrap.dataset.deleting = "1";
+  c.style.transition = "transform .22s ease, opacity .22s ease .05s";
+  c.style.transform = `translateX(${-(wrap.offsetWidth + 40)}px)`;
+  c.style.opacity = "0";
+  let fired = false;
+  const fire = () => {
+    if(fired) return;
+    fired = true;
+    if(swipe.openWrap === wrap) swipe.openWrap = null;
+    deleteWithUndo([id], "Transaction deleted.");
+  };
+  on(c, "transitionend", fire, {once:true});
+  setTimeout(fire, 320);
+}
+
+on(document, "touchstart", e => {
+  const wrap = elOf(e.target)?.closest(".swipe-wrap");
+  if(!wrap){ closeSwipe(); swipe.content = null; return; }
+  if(swipe.openWrap && swipe.openWrap !== wrap) closeSwipe();
+  const c = wrap.querySelector(".swipe-content");
+  if(!c){ swipe.content = null; return; }
+  const icon = wrap.querySelector(".swipe-delete-icon");
+  c.style.transition = "none";
+  if(icon) icon.style.transition = "none";
+  Object.assign(swipe, {
+    content:c, wrap, icon, startX:e.touches[0].clientX, startY:e.touches[0].clientY,
+    baseX: swipe.openWrap === wrap ? SWIPE_OPEN : 0, dragging:false, axis:null
+  });
+  swipe.tx = swipe.baseX;
+  positionSwipeIcon(icon, swipe.tx);
+}, {passive:true});
+
+on(document, "touchmove", e => {
+  if(!swipe.content) return;
+  const dx = e.touches[0].clientX - swipe.startX, dy = e.touches[0].clientY - swipe.startY;
+  if(swipe.axis === null){
+    if(Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+    swipe.axis = Math.abs(dx) > Math.abs(dy) ? "x" : "y";
+  }
+  if(swipe.axis === "y") return;
+  e.preventDefault();
+  swipe.dragging = true;
+  swipe.tx = clamp(swipe.baseX + dx, -(swipe.wrap.offsetWidth + 40), 0);
+  swipe.content.style.transform = `translateX(${swipe.tx}px)`;
+  positionSwipeIcon(swipe.icon, swipe.tx);
+}, {passive:false});
+
+/* `cancelled` = iOS took the touch away (system gesture, incoming call): the row snaps
+   shut and nothing is deleted. Without this it stayed stuck half-open. */
+function endSwipe(cancelled){
+  if(!swipe.content) return;
+  swipe.content.style.transition = "transform .18s ease";
+  if(swipe.icon) swipe.icon.style.transition = "right .18s ease";
+  if(swipe.dragging){
+    if(!cancelled && swipe.tx <= -swipe.wrap.offsetWidth * 0.6){
+      commitSwipeDelete(swipe.wrap);
+    }else if(!cancelled && swipe.tx <= SWIPE_OPEN / 2){
+      swipe.content.style.transform = `translateX(${SWIPE_OPEN}px)`;
+      positionSwipeIcon(swipe.icon, SWIPE_OPEN);
+      swipe.openWrap = swipe.wrap;
+    }else{
+      swipe.content.style.transform = "translateX(0)";
+      positionSwipeIcon(swipe.icon, 0);
+      swipe.openWrap = null;
+    }
+  }
+  Object.assign(swipe, {content:null, wrap:null, icon:null, dragging:false, axis:null});
+}
+on(document, "touchend", () => endSwipe(false), {passive:true});
+on(document, "touchcancel", () => endSwipe(true), {passive:true});
+
+/* ================= Delegated clicks ================= */
+on(document, "click", e => {
+  const target = elOf(e.target);
+  const node = target?.closest("[data-act]");
+  const act = node?.dataset.act;
+
+  /* First tap while a row is swiped open only closes it. */
+  if(swipe.openWrap){
+    const inside = swipe.openWrap.contains(target);
+    closeSwipe();
+    if(inside && act !== "swipedelete"){ e.preventDefault(); e.stopImmediatePropagation(); return; }
+  }
+  if(!act) return;
+  const id = parseInt(node.dataset.id, 10);
+  if(isNaN(id)) return;
+
+  if(act === "person"){
+    const prev = openPersonId;
+    openPersonId = openPersonId === id ? null : id;
+    /* Collapsing the previously open row and expanding the new one are the only
+       two cards that changed — the rest of the list is untouched. */
+    refreshPersonCards(prev, id);
+  }else if(act === "txn"){
+    e.stopPropagation();
+    openEdit(id);
+  }else if(act === "receipt"){
+    e.stopPropagation();
+    receiptURL(id).then(url => url ? openLightbox(url) : showError("That receipt is missing."));
+  }else if(act === "swipedelete"){
+    e.stopPropagation();
+    const wrap = node.closest(".swipe-wrap");
+    if(wrap) commitSwipeDelete(wrap);
+  }else if(act === "settleUp"){
+    e.stopPropagation();
+    openSettle(id);
+  }else if(act === "quickAdd"){
+    e.stopPropagation();
+    openQuickAdd(id, node.dataset.type);
+  }
+});
+
+on($("settledToggle"), "click", () => {
+  showSettled = !showSettled;
+  try{ localStorage.setItem(SETTLED_KEY, showSettled ? "1" : "0"); }catch(e){}
+  renderPeople();
+});
+
+/* ================= Tabs & filters ================= */
+const overviewTabEl = $("overviewTab"), historyTabEl = $("historyTab");
+function switchTab(name){
+  if(name === currentTab) return;
+  currentTab = name;
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
+  overviewTabEl.hidden = name !== "overview";
+  historyTabEl.hidden = name !== "history";
+  /* The hidden tab is left stale by refreshAll, so it's only rebuilt on the way in —
+     and skipped entirely if nothing changed while it was away. */
+  if(name === "history"){
+    if(tabDirty.history){ renderHistory(); tabDirty.history = false; }
+  }else if(tabDirty.overview){ renderPeople(); tabDirty.overview = false; }
+}
+document.querySelectorAll(".tab").forEach(tab => on(tab, "click", () => switchTab(tab.dataset.tab)));
+
+/* Typing fires a list rebuild, so it waits for a short pause. */
+let searchTimer = null;
+on(fSearchEl, "input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(renderHistoryFresh, 120);
+});
+/* The keyboard's Search key puts the keyboard away. */
+on(fSearchEl, "keydown", e => { if(e.key === "Enter") fSearchEl.blur(); });
+
+/* ================= Sheet inputs ================= */
+on(personSelect, "change", function(){
+  newPersonName.style.display = this.value === "__new__" ? "block" : "none";
+  if(this.value === "__new__") newPersonName.focus();
+  setErr("");
+});
+on(methodSelect, "change", function(){
+  newMethodName.style.display = this.value === "__new__" ? "block" : "none";
+  if(this.value === "__new__") newMethodName.focus();
+});
+on(typeGrid, "click", e => {
+  const opt = elOf(e.target)?.closest(".type-opt");
+  if(!opt || editingTxnId) return;
+  setTypeUI(opt.dataset.type, false);
+  setErr("");
+});
+
+/* Cents-first entry, shared by both amount fields: typing appends a digit, Backspace
+   drops one, and pasted text is read as dollars ("12.5" → $12.50, "S$1,200" →
+   $1,200.00) — the digits-only path would turn "12.5" into $1.25. */
+function wireAmount(input, get, set){
+  on(input, "input", () => {
+    const digits = input.value.replace(/\D/g, "").slice(0, 11).replace(/^0+(?=\d)/, "");
+    set(digits ? parseInt(digits, 10) : 0);
+    const len = input.value.length;
+    try{ input.setSelectionRange(len, len); }catch(err){}
+  });
+  on(input, "keydown", e => {
+    if(e.key === "Backspace"){ e.preventDefault(); set(Math.floor(get() / 10)); }
+  });
+  on(input, "paste", e => {
+    const txt = (e.clipboardData?.getData("text") || "").replace(/s?\$|,|\s/gi, "");
+    if(!/^\d*\.?\d+$/.test(txt)) return;
+    e.preventDefault();
+    set(Math.round(parseFloat(txt) * 100));
+  });
+}
+wireAmount(amountInput, () => amountCents, setAmountCents);
+wireAmount(settleAmountInput, () => settleAmountCents, setSettleAmountCents);
+/* Tapping into an amount always puts the cursor at the end, where typing works. */
+[amountInput, settleAmountInput].forEach(i => on(i, "focus", () => setTimeout(() => {
+  const len = i.value.length; try{ i.setSelectionRange(len, len); }catch(err){}
+}, 0)));
+/* Return / Done on the keyboard saves the sheet. */
+[[overlay, "saveBtn"], [settleOverlay, "settleSaveBtn"], [personOverlay, "personSaveBtn"]].forEach(([o, btn]) =>
+  on(o, "keydown", e => {
+    if(e.key !== "Enter" || e.isComposing || elOf(e.target)?.tagName !== "INPUT") return;
+    e.preventDefault();
+    e.target.blur();
+    $(btn).click();
+  }));
+
+on($("receiptFile"), "change", e => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if(!file) return;
+  if(!/^image\//.test(file.type)) return setErr("Please choose an image file.");
+  const forTxn = editingTxnId;
+  compressImage(file, blob => {
+    /* Compression is async — the sheet may have closed or moved to another entry. */
+    if(!isOpen(overlay) || editingTxnId !== forTxn) return;
+    if(!blob) return setErr("Couldn't read that image.");
+    setRcpt({mode:"new", blob, url:URL.createObjectURL(blob), temp:true});
+    setErr("");
+  });
+});
+on($("lightboxClose"), "click", closeLightbox);
+on(lightbox, "click", e => { if(e.target === lightbox) closeLightbox(); });
+
+on($("fabBtn"), "click", openAdd);
+on($("cancelBtn"), "click", closeSheet);
+on($("backupBtn"), "click", () => openOverlay(backupOverlay));
+on($("closeBackupBtn"), "click", closeBackup);
+on($("settingsBtn"), "click", () => {
+  syncFaceIDUI();
+  openOverlay(settingsOverlay);
+});
+on($("closeSettingsBtn"), "click", () => closeOverlay(settingsOverlay));
+/* Deleting everything needs more friction than a tap — typing the word out loud
+   matches how most finance apps gate their single most destructive action. */
+function closeDeleteAll(){ closeOverlay(deleteAllOverlay); $("deleteAllInput").value = ""; $("deleteAllConfirmBtn").disabled = true; }
+on($("deleteAllBtn"), "click", () => { $("deleteAllInput").value = ""; $("deleteAllConfirmBtn").disabled = true; openOverlay(deleteAllOverlay); });
+on($("deleteAllCancelBtn"), "click", closeDeleteAll);
+on($("deleteAllInput"), "input", function(){ $("deleteAllConfirmBtn").disabled = this.value.trim().toUpperCase() !== "DELETE"; });
+on($("deleteAllConfirmBtn"), "click", async () => {
+  if($("deleteAllInput").value.trim().toUpperCase() !== "DELETE") return;
+  commitTrash();
+  urlCache.forEach((u, id) => dropReceiptURL(id));
+  urlCache.clear();
+  state = blank();
+  openPersonId = editingTxnId = editingPersonId = null;
+  try{ await Store.clear(); }catch(e){}
+  $("backupReminder")?.remove();                   // nothing left to back up
+  persist(); closeDeleteAll(); closeOverlay(settingsOverlay); refreshAll(); toast("All data deleted.");
+});
+
+/* ================= Payment methods editor ================= */
+const setPtErr = msg => showErrIn("ptErr", msg);
+
+function renderPtList(){
+  const list = $("ptList");
+  const methods = [...state.paymentTypes].sort((a, b) => a.localeCompare(b));
+  if(!methods.length){ list.innerHTML = '<div class="txn-note">No payment methods yet.</div>'; return; }
+  const counts = new Map();
+  state.transactions.forEach(t => counts.set(t.payment_type, (counts.get(t.payment_type) || 0) + 1));
+  list.innerHTML = methods.map(m => {
+    const n = counts.get(m) || 0;
+    return `<div class="pt-row" data-name="${esc(m)}">`
+      + `<div class="pt-name">${esc(m)}${n ? ` <span style="color:var(--dim);font-weight:400;">(${n})</span>` : ""}</div>`
+      + `<button type="button" class="pt-icon-btn" data-act="ptRename" aria-label="Rename">${EDIT_ICON}</button>`
+      + `<button type="button" class="pt-icon-btn danger" data-act="ptDelete" aria-label="Delete">${TRASH_ICON}</button>`
+      + `</div>`;
+  }).join("");
+}
+
+on($("ptList"), "click", e => {
+  const btn = elOf(e.target)?.closest("button[data-act]");
+  if(!btn) return;
+  const row = btn.closest(".pt-row"), oldName = row.dataset.name, act = btn.dataset.act;
+
+  if(act === "ptRename"){
+    row.innerHTML = `<input type="text" value="${esc(oldName)}" id="ptRenameInput" autocomplete="off">`
+      + '<button type="button" class="pt-icon-btn" data-act="ptRenameSave" aria-label="Save"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></button>'
+      + '<button type="button" class="pt-icon-btn" data-act="ptRenameCancel" aria-label="Cancel"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>';
+    const input = $("ptRenameInput");
+    input.focus(); input.select();
+    on(input, "keydown", e2 => {
+      if(e2.key === "Enter") row.querySelector('[data-act="ptRenameSave"]').click();
+    });
+    return;
+  }
+
+  if(act === "ptRenameSave"){
+    const newName = $("ptRenameInput").value.trim();
+    setPtErr("");
+    if(!newName) return setPtErr("Enter a name.");
+    if(state.paymentTypes.some(m => m.toLowerCase() === newName.toLowerCase() && m !== oldName))
+      return setPtErr("That payment method already exists.");
+    if(newName !== oldName){
+      const idx = state.paymentTypes.indexOf(oldName);
+      if(idx !== -1) state.paymentTypes[idx] = newName;
+      state.transactions.forEach(t => { if(t.payment_type === oldName) t.payment_type = newName; });
+      persist(); refreshAll();
+      showOk(`Renamed to \u201c${newName}\u201d.`);
+    }
+    renderPtList();
+    return;
+  }
+
+  if(act === "ptRenameCancel") return renderPtList();
+
+  if(act === "ptDelete"){
+    const n = state.transactions.filter(t => t.payment_type === oldName).length;
+    appConfirm(n
+      ? `Delete \u201c${oldName}\u201d? ${n} transaction${n === 1 ? "" : "s"} using it will be marked \u201cNot specified.\u201d`
+      : `Delete \u201c${oldName}\u201d?`, () => {
+      state.paymentTypes = state.paymentTypes.filter(m => m !== oldName);
+      state.transactions.forEach(t => { if(t.payment_type === oldName) t.payment_type = ""; });
+      persist(); refreshAll(); renderPtList();
+      toast("Payment method deleted.");
+    });
+  }
+});
+
+on($("ptAddBtn"), "click", () => {
+  const name = $("ptNewInput").value.trim();
+  setPtErr("");
+  if(!name) return setPtErr("Enter a name.");
+  if(state.paymentTypes.some(m => m.toLowerCase() === name.toLowerCase())) return setPtErr("That payment method already exists.");
+  state.paymentTypes.push(name);
+  persist();
+  $("ptNewInput").value = "";
+  renderPtList();
+  showOk("Payment method added.");
+});
+on($("ptNewInput"), "keydown", e => { if(e.key === "Enter") $("ptAddBtn").click(); });
+
+on($("paymentTypesBtn"), "click", () => {
+  setPtErr("");
+  $("ptNewInput").value = "";
+  renderPtList();
+  closeOverlay(settingsOverlay);
+  openOverlay(paymentTypesOverlay);
+});
+on($("ptCloseBtn"), "click", () => closeOverlay(paymentTypesOverlay));
+
+/* ================= Backup ================= */
+/* Files go out through the iOS share sheet — Save to Files, AirDrop, Mail, etc.
+   Returns false if the user dismissed the sheet, so no "exported" toast is shown.
+   iOS only opens the share sheet straight from a tap. Building a big or encrypted backup
+   can outlast that tap, so when iOS refuses, the finished file waits behind a "Share"
+   toast and goes out on that fresh tap instead of failing. */
+const SHARE_WAIT_MS = 20000;
+async function download(filename, text, mime){
+  const data = {files:[new File([text], filename, {type:mime})]};
+  const aborted = e => e && e.name === "AbortError";   // user closed the share sheet
+  try{
+    await navigator.share(data);
+    return true;
+  }catch(e){
+    if(aborted(e)) return false;
+    if(!e || e.name !== "NotAllowedError") throw e;
+  }
+  return new Promise((res, rej) => {
+    const giveUp = setTimeout(() => res(false), SHARE_WAIT_MS + 500);
+    renderToast("File ready.", null, {label:"Share", fn:() => {
+      clearTimeout(giveUp);
+      navigator.share(data).then(() => res(true), e => aborted(e) ? res(false) : rej(e));
+    }}, SHARE_WAIT_MS);
+  });
+}
+const stamp = () => toLocalDay(new Date());
+
+/* ---- Backup encryption: PBKDF2-SHA256 → AES-256-GCM, all on-device via WebCrypto. ---- */
+const ENC_FORMAT = "debt-tracker-encrypted", ENC_ITER = 310000;
+const u8ToB64 = u8 => { let s = ""; for(let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000)); return btoa(s); };
+const b64ToU8 = b64 => { const bin = atob(b64); const u = new Uint8Array(bin.length); for(let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+async function deriveKey(password, salt, iter){
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({name:"PBKDF2", salt, iterations:iter, hash:"SHA-256"}, base, {name:"AES-GCM", length:256}, false, ["encrypt", "decrypt"]);
+}
+async function encryptText(text, password){
+  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(password, salt, ENC_ITER);
+  const data = new Uint8Array(await crypto.subtle.encrypt({name:"AES-GCM", iv}, key, new TextEncoder().encode(text)));
+  return JSON.stringify({format:ENC_FORMAT, v:1, iter:ENC_ITER, salt:u8ToB64(salt), iv:u8ToB64(iv), data:u8ToB64(data)});
+}
+async function decryptText(obj, password){
+  const iter = Math.min(Math.max(parseInt(obj.iter, 10) || ENC_ITER, 100000), 5000000);
+  const key = await deriveKey(password, b64ToU8(obj.salt), iter);
+  const plain = await crypto.subtle.decrypt({name:"AES-GCM", iv:b64ToU8(obj.iv)}, key, b64ToU8(obj.data));
+  return new TextDecoder().decode(plain);
+}
+
+function markExported(){
+  try{ localStorage.setItem(LAST_EXPORT_KEY, String(Date.now())); }catch(e){}
+  const r = $("backupReminder");
+  if(r) r.remove();
+}
+
+/* The .json backup inlines photos as data URLs so a single file restores everything. */
+let exporting = false;
+on($("exportBtn"), "click", async () => {
+  if(exporting) return;
+  exporting = true;
+  try{
+    const pw = $("backupPassword").value;
+    toast(pw ? "Encrypting backup…" : "Preparing backup…");
+    const out = JSON.parse(JSON.stringify(state));
+    await Promise.all(out.transactions.map(async t => {
+      if(!t.receipt){ t.receipt = null; return; }
+      const v = await Store.getReceipt(t.id);
+      t.receipt = !v ? null : (typeof v === "string" ? v : await blobToDataURL(v));
+    }));
+    let text = JSON.stringify(out);
+    if(pw) text = await encryptText(text, pw);
+    const name = `debt-tracker-backup-${stamp()}${pw ? "-encrypted" : ""}.json`;
+    if(await download(name, text, "application/json")){
+      markExported();
+      showOk(pw ? "Encrypted backup exported." : "Backup exported — not password-protected.");
+    }
+  }catch(e){ showError("Export failed — try again."); }
+  finally{ exporting = false; }
+});
+
+/* Excel-friendly CSV. The BOM makes Excel read it as UTF-8; cells that start with
+   = + - @ are prefixed so a name or note can never run as a formula. */
+const csvCell = v => {
+  let s = String(v ?? "");
+  if(/^[=+\-@\t\r]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s)) s = "'" + s;   // plain negatives stay numbers
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+on($("csvBtn"), "click", async () => {
+  const rows = [["Date", "Time", "Person", "Type", "Amount (SGD)", "Signed (SGD)", "Payment type", "Description", "Settlement", "Edited at"]];
+  [...sortedTxns].reverse().forEach(t => {
+    const d = new Date(t.txn_date);
+    rows.push([
+      toLocalDay(d), `${pad2(d.getHours())}:${pad2(d.getMinutes())}`,
+      nameOf.get(t.person_id) || "", TYPE_LABELS[t.type], t.amount.toFixed(2), signedAmount(t).toFixed(2),
+      t.payment_type, t.note, t.settlement ? "Yes" : "", t.edited_at ? new Date(t.edited_at).toLocaleString() : ""
+    ]);
+  });
+  const text = "\uFEFF" + rows.map(r => r.map(csvCell).join(",")).join("\r\n");
+  try{
+    if(await download(`debt-tracker-${stamp()}.csv`, text, "text/csv")) showOk("CSV exported.");
+  }catch(e){ showError("Export failed — try again."); }
+});
+
+function readFile(input, onText){
+  const file = input.files[0];
+  input.value = "";
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = evt => onText(String(evt.target.result));
+  reader.onerror = () => showError("Couldn't read that file.");
+  reader.readAsText(file);
+}
+
+on($("importBtn"), "click", () => $("importFile").click());
+on($("importFile"), "change", function(){
+  readFile(this, async text => {
+    let parsed;
+    try{
+      parsed = JSON.parse(text);
+    }catch(err){
+      return showError("Couldn't read that file. Make sure it's a Debt Tracker .json backup.");
+    }
+    if(parsed && parsed.format === ENC_FORMAT){
+      const pw = $("backupPassword").value;
+      if(!pw) return showError("This backup is encrypted. Enter its password above, then import again.");
+      try{ parsed = JSON.parse(await decryptText(parsed, pw)); }
+      catch(err){ return showError("Wrong password, or the file is damaged."); }
+    }
+    if(!parsed || !Array.isArray(parsed.people) || !Array.isArray(parsed.transactions)){
+      return showError("Couldn't read that file. Make sure it's a Debt Tracker .json backup.");
+    }
+    const photos = new Map();
+    const inc = normalize(parsed, photos);
+    const msg = `This backup holds ${inc.people.length} ${inc.people.length === 1 ? "person" : "people"} `
+      + `and ${inc.transactions.length} transaction${inc.transactions.length === 1 ? "" : "s"}. `
+      + "It will replace everything on this iPhone. This can't be undone.";
+
+    const replace = async () => {
+      try{
+        /* Decode every photo BEFORE wiping anything. A corrupt photo used to throw after
+           Store.clear(), leaving the device with no data at all. Bad photos are dropped. */
+        const blobs = new Map();
+        for(const [id, dataUrl] of photos){
+          try{ blobs.set(id, dataURLtoBlob(dataUrl)); }catch(e){}
+        }
+        inc.transactions.forEach(t => { if(t.receipt && !blobs.has(t.id)) t.receipt = 0; });
+
+        commitTrash();
+        clearTimeout(saveTimer); saveDirty = false;
+        /* One all-or-nothing write: if anything fails, the old ledger is still there. */
+        await Store.replaceAll(inc, blobs);
+        urlCache.forEach((u, id) => dropReceiptURL(id));
+        urlCache.clear();
+        state = inc;
+        openPersonId = editingTxnId = editingPersonId = null;
+        closeBackup(); refreshAll(); showOk("Backup restored.");
+      }catch(e){ onStorageError(e); }
+    };
+    /* Confirm sits above the Backup sheet, so it's answered here — not after closing it. */
+    appConfirm(msg, replace, "Replace", null, "Restore backup");
+  });
+});
+
+/* ================= Fatal errors ================= */
+/* A failed load is a stop, not a warning: the app is blocked so no half-initialised
+   state can be written back, and the user is given a way to salvage what's on disk. */
+function showFatal(err){
+  bootOk = false;
+  $("fatalMsg").textContent = err && err.transient
+    ? "Storage was slow to open. Your data hasn't been touched — close the app fully, then open it again."
+    : "Your data hasn't been touched. The app stopped here so that nothing could be written over it.";
+  $("fatalDetail").textContent = "Technical details are in the browser console.";
+  console.error("Debt Tracker fatal error:", err);
+  $("fatal").classList.add("open");
+  document.body.classList.add("locked");
+}
+on($("fatalReload"), "click", () => location.reload());
+on($("fatalExport"), "click", async () => {
+  try{
+    let raw = null;
+    /* Storage may never have opened (that can be why we're here) — try once more, read-only. */
+    if(!Store.db){ try{ await Store.init(); }catch(e){} }
+    try{ raw = await Store.loadLedger(); }catch(e){}
+    if(!raw){
+      const legacy = lsGet(LS_LEDGER) || lsGet(LS_KEY);
+      if(legacy) raw = JSON.parse(legacy);
+    }
+    if(!raw) return showError("No readable data found to export.");
+    if(await download(`debt-tracker-raw-${stamp()}.json`, JSON.stringify(raw), "application/json")) showOk("Raw data exported.");
+  }catch(e){ showError("Couldn't export the stored data."); }
+});
+
+/* ================= Boot ================= */
+/* One-time lift of the old localStorage v2 blob into the new stores. */
+async function migrateLegacy(){
+  if(lsGet(MIGRATED_KEY) || !lsGet(LS_KEY)) return null;
+  try{
+    const photos = new Map();
+    const migrated = normalize(JSON.parse(lsGet(LS_KEY)), photos);
+    for(const [id, dataUrl] of photos) await Store.putReceipt(id, dataURLtoBlob(dataUrl));
+    await Store.saveLedger(migrated);
+    try{ localStorage.setItem(MIGRATED_KEY, "1"); }catch(e){}
+    return migrated;
+  }catch(e){ return null; }
+}
+
+/* Photos with no surviving transaction (tab closed mid-undo, an interrupted import)
+   would otherwise sit in storage forever. Cheap, non-blocking, runs after first paint. */
+async function sweepOrphanReceipts(){
+  try{
+    const live = new Set(state.transactions.filter(t => t.receipt).map(t => t.id));
+    const dead = (await Store.receiptIds()).filter(id => !live.has(id));
+    if(dead.length) await Store.delReceipt(dead);
+  }catch(e){}
+}
+
+(async () => {
+  try{
+    loadTheme();
+    syncFaceIDUI();
+    await ensureUnlocked();
+
+    setRcpt(null);
+    setTxnDate(new Date());
+
+    await Store.init();
+    if(Store.mode === "memory"){
+      showBanner();
+      $("storageNote").textContent = "Storage is unavailable here, so nothing saves automatically. Export before you close the page, and import to restore.";
+    }
+    state = (await migrateLegacy()) || normalize(await Store.loadLedger());
+    bootOk = true;                       /* writes are unlocked only once data is really loaded */
+    refreshAll();
+    sweepOrphanReceipts();
+    /* Asks iOS to treat this storage as persistent, so it isn't cleared under space pressure. */
+    try{ if(navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); }catch(e){}
+    remindBackup();
+  }catch(err){
+    showFatal(err);
+  }
+
+})();
+
+if("serviceWorker" in navigator){
+  on(window, "load", () => {
+    navigator.serviceWorker.register("sw.js").then(reg => {
+      reg.addEventListener("updatefound", () => {
+        const w = reg.installing;
+        if(!w) return;
+        w.addEventListener("statechange", () => {
+          if(w.state === "installed" && navigator.serviceWorker.controller) toast("Update ready — reopen the app to apply.");
+        });
+      });
+    }).catch(() => {});
+  });
+}
+})();
+
+</script>
+</body>
+</html>
