@@ -24,6 +24,8 @@ DATA — DON'T BREAK THESE
   "receipts" = photo Blobs keyed by txn id). Falls back to localStorage, then memory.
 - Every write goes through persist() → flush(). Never write before bootOk is true
   (an empty `state` would overwrite the real ledger).
+- Store writes run in order through Store.serial() (encrypting is async). Anything that
+  touches both stores uses Store.both() — one transaction, all or nothing.
 - Any change to the stored shape must also be handled in normalize() — it repairs and
   validates EVERYTHING loaded from storage or a backup file. Treat imports as hostile.
 - Amounts are dollars rounded to 2dp (round2); amount entry works in cents.
@@ -34,18 +36,32 @@ DATA — DON'T BREAK THESE
 - Import is replace-only via Store.replaceAll() (one atomic write). Keep it atomic.
 
 SECURITY — DON'T WEAKEN
-- Face ID lock = WebAuthn platform passkey used as a UI gate only. The ledger is NOT
-  encrypted at rest. Keys starting "debtTrackerFace…" in localStorage hold lock state.
+- Face ID lock = WebAuthn platform passkey. It gates the UI AND, in IndexedDB mode,
+  encrypts the ledger + receipts at rest: passkey PRF secret → HKDF-SHA256 → AES-256-GCM
+  (Store.key, memory only, never stored). Records are {enc:1, iv, data}; the ledger
+  record also carries credId + salt and is the source of truth for the lock at boot.
+  Each record's AAD names its slot. Don't change AAD strings, HKDF info or record shape
+  without a migration — existing ledgers would become unreadable.
+- Lock on/off rewrites the whole store via Store.reseal() (verified, one transaction).
+  Turning the lock off must decrypt BEFORE the lock is removed. If the passkey gave no
+  secret at set-up, sealWith() encrypts at the next unlock; a passkey with no PRF stays
+  a screen lock only (Settings says which). localStorage/memory modes: screen lock only.
+- Boot order: open storage → read raw record → Face ID → derive key → load. A storage
+  error is only shown after Face ID passes. A wrong key = fatal screen, nothing written.
+- Keys starting "debtTrackerFace…" in localStorage hold lock state (a cache when the
+  ledger is encrypted).
 - Cancelling Face ID is not a failed attempt; 5 real failures = 15-min cool-down.
   Erasing from the lock screen requires typing ERASE. Never add a one-tap bypass/wipe.
 - Fixed passkey user handle (debtTrackerFaceUser_v1) so re-enrolling doesn't pile up.
 - Escape all user/imported text with esc() before innerHTML. Receipt data URLs must
   pass SAFE_IMG_URL. CSV cells go through csvCell() (formula-injection guard).
 - CSP meta tag blocks all off-site requests. Keep it; update it if you add a source.
-- Backups can be password-encrypted (PBKDF2-SHA256 310k → AES-256-GCM, format
-  "debt-tracker-encrypted"). Export uses the iOS share sheet (navigator.share); if iOS
-  refuses it (tap expired while the file was built), download() offers a "Share" toast.
-  The backup password field is cleared whenever the Backup sheet closes.
+- Backups are ALWAYS password-encrypted (8+ chars; PBKDF2-SHA256 600k → AES-256-GCM,
+  format "debt-tracker-encrypted" v2 with an authenticated header). v1 (310k) and old
+  plain backups still import. Not encrypted, on purpose: the CSV export and the fatal
+  screen's "Export raw data" rescue. Export uses the iOS share sheet (navigator.share);
+  if iOS refuses it (tap expired while the file was built), download() offers a "Share"
+  toast. The backup password field is cleared whenever the Backup sheet closes.
 
 MINIMALIST BY DESIGN — DON'T ADD THESE BACK (owner removed them on purpose)
 - Pull-to-refresh, long-press menus, custom date wheel (native date inputs are used),
@@ -83,11 +99,15 @@ UI CONVENTIONS
 TESTING
 - No build step. Syntax-check by extracting the main script block and running
   `node --check` on it. (Don't write literal script/style tags inside this note.)
-- Serve over http to test; Chrome can't exercise Face ID or the share sheet (exports
-  need navigator.share) — those need a real iPhone.
+- Serve over http to test. Desktop Chrome can run the lock + encryption paths with a
+  DevTools virtual authenticator (internal, user-verified, PRF on); the share sheet
+  (exports need navigator.share) and real Face ID need an iPhone.
 
 LAST REVIEW (Nov 2026) — still open
-- Ledger at-rest encryption (e.g. WebAuthn PRF) not done.
+- Ledger encryption is NOT yet tested on a real iPhone (passkey PRF needs iOS 18+).
+  Check on device: turn on, cold start, resume after 1 min, turn off, erase + restore.
+- The decrypted ledger stays in memory while the app is open, also behind the re-lock
+  screen. Encryption protects what is stored, not a running unlocked app.
 - No due dates/reminders, no person search.
 - Editing or deleting a debt after it was settled can still leave a balance past zero.
 - Keyboard/viewport behaviour of the sheets has only been checked in desktop Chrome.
@@ -95,6 +115,9 @@ LAST REVIEW (Nov 2026) — still open
 
 CHANGE LOG — MAX 5 LINES, newest first, one line each. When adding a 6th, delete the
 oldest. Anything still worth knowing belongs in the rules above, not here.
+- 2026-11-15: Security pass — ledger encrypted at rest via Face ID passkey (PRF);
+  backups always encrypted (600k, v2); ordered/atomic store writes; blank lock screen
+  on resume fixed; duplicate helpers merged.
 - 2026-11-11: Bug-fix pass — ghost toast taps, export refused by iOS, UTC file dates,
   stuck swipe rows, early backdrop dismiss, leftover keyboard/password, date-field layout.
 - 2026-11-11: iPhone-only trim — desktop/keyboard/Android code and unused CSS removed.
@@ -102,8 +125,6 @@ oldest. Anything still worth knowing belongs in the rules above, not here.
   focus, double-tap zoom), Return saves, settle pre-filled, one-tap delete with Undo.
 - 2026-11-11: Merge, person phone/notes, History filters and cross-tab sync removed;
   one search box now covers name, amount, date, note, type and settlements.
-- 2026-11-11: Minimalist strip — decorative features removed; native date pickers;
-  theme follows the phone.
 =====================================================================================
 -->
 <html lang="en">
@@ -332,7 +353,7 @@ body.dark .toast.success{background:#1C8B4D}
 .pt-icon-btn:active{transform:scale(.9)}
 .pt-icon-btn.danger{color:var(--danger)}
 .btn-danger,.ra-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px}
-.settle-max{font-size:12px;font-weight:700;color:var(--dim);background:none;border:none;font-family:inherit;padding:0;text-decoration:underline}
+.link-btn{font-size:12px;font-weight:700;color:var(--dim);background:none;border:none;font-family:inherit;padding:0;text-decoration:underline}
 
 /* ---- iOS-style toggle switch ---- */
 .ios-switch{width:51px;height:31px;border-radius:999px;background:var(--track);position:relative;border:none;padding:0;flex-shrink:0;transition:background .2s ease}
@@ -510,7 +531,7 @@ body.dark .toast.success{background:#1C8B4D}
     <div class="field">
       <label for="settleAmountInput">Amount (SGD)</label>
       <input type="text" id="settleAmountInput" enterkeyhint="done" placeholder="0.00" inputmode="numeric" autocomplete="off">
-      <div class="lock-note"><button type="button" class="settle-max" id="settleMaxBtn">Use full amount</button></div>
+      <div class="lock-note"><button type="button" class="link-btn" id="settleMaxBtn">Use full amount</button></div>
     </div>
 
     <div class="field">
@@ -538,14 +559,16 @@ body.dark .toast.success{background:#1C8B4D}
 <div class="overlay" id="backupOverlay">
   <div class="sheet" role="dialog" aria-modal="true">
     <h2>Backup &amp; Restore</h2>
+    <div class="err" id="backupErr"></div>
     <div class="field-desc" id="storageNote">Data — including receipt photos — is stored on this iPhone only. Export a backup regularly so you never lose the ledger.</div>
     <div class="field">
       <label for="backupPassword">Backup password</label>
-      <input type="password" id="backupPassword" placeholder="Recommended" autocomplete="new-password" spellcheck="false">
-      <div class="lock-note">Encrypts the backup file. Needed again to import it — there's no way to recover a forgotten password.</div>
+      <input type="password" id="backupPassword" placeholder="At least 8 characters" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <div class="lock-note"><button type="button" class="link-btn" id="backupPwShow">Show password</button></div>
+      <div class="lock-note">Every backup is encrypted with this password. You need it again to import — a forgotten password can't be recovered.</div>
     </div>
     <div class="row-action">
-      <div><div class="ra-title">Export Backup</div><div class="ra-sub" id="exportSub">Full .json — restores everything</div></div>
+      <div><div class="ra-title">Export Backup</div><div class="ra-sub">Encrypted .json — restores everything</div></div>
       <button class="ra-btn" id="exportBtn">Export</button>
     </div>
     <div class="row-action">
@@ -553,7 +576,7 @@ body.dark .toast.success{background:#1C8B4D}
       <button class="ra-btn secondary" id="importBtn">Import</button>
     </div>
     <div class="row-action">
-      <div><div class="ra-title">Export to Excel</div><div class="ra-sub">.csv of every transaction — not a backup</div></div>
+      <div><div class="ra-title">Export to Excel</div><div class="ra-sub">.csv of every transaction — not encrypted, not a backup</div></div>
       <button class="ra-btn secondary" id="csvBtn">Export</button>
     </div>
     <input type="file" id="importFile" accept=".json,application/json">
@@ -717,6 +740,15 @@ const $ = id => document.getElementById(id);
 const elOf = t => t && (t.nodeType === 1 ? t : t.parentElement);
 const on = (node, ev, fn, opts) => node.addEventListener(ev, fn, opts);
 const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+const lsGet = k => { try{ return localStorage.getItem(k); }catch(e){ return null; } };
+/* An empty value removes the key. Returns false if storage refused the write. */
+const lsSet = (k, v) => { try{ v ? localStorage.setItem(k, String(v)) : localStorage.removeItem(k); return true; }catch(e){ return false; } };
+const enc8 = s => new TextEncoder().encode(s);
+const rand = n => crypto.getRandomValues(new Uint8Array(n));
+const u8ToB64 = u8 => { let s = ""; for(let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000)); return btoa(s); };
+const b64ToU8 = b64 => { const bin = atob(b64); const u = new Uint8Array(bin.length); for(let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+const b64uEncode = buf => u8ToB64(new Uint8Array(buf)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const b64uDecode = str => b64ToU8(str.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - str.length % 4) % 4));
 /* Sheet errors sit at the top of the sheet — bring them into view if it's scrolled. */
 const showErrIn = (id, msg) => { const el = $(id); el.textContent = msg || ""; if(msg) el.scrollIntoView({block:"nearest"}); };
 
@@ -727,7 +759,7 @@ let state = blank();
 let currentTab = "overview";
 let openPersonId = null, editingTxnId = null, editingPersonId = null;
 let selectedType = null, txnDate = new Date(), amountCents = 0;
-let showSettled = false;
+let showSettled = lsGet(SETTLED_KEY) === "1";
 
 /* Derived indexes — rebuilt once per data change, not per render. */
 let balanceOf = new Map(), txnsOf = new Map(), nameOf = new Map();
@@ -824,14 +856,35 @@ function normalize(raw, outReceipts){
   return s;
 }
 
+/* ================= Ledger encryption at rest =================
+   With the Face ID lock on, the ledger and every receipt photo are stored encrypted
+   (AES-256-GCM). The key is never stored: Face ID releases a secret from the passkey
+   (WebAuthn PRF), and HKDF turns that into the key, which lives in memory only while
+   the app is open. Each record is bound to its slot (AAD), so records can't be swapped. */
+const AAD_LEDGER = "debtTracker:ledger:v1", aadRcpt = id => "debtTracker:receipt:" + id;
+const isSealed = v => !!v && v.enc === 1 && !!v.iv && !!v.data;
+async function ledgerKeyFrom(prfOut){
+  const base = await crypto.subtle.importKey("raw", prfOut, "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({name:"HKDF", hash:"SHA-256", salt:new Uint8Array(32), info:enc8("debtTracker ledger key v1")},
+    base, {name:"AES-GCM", length:256}, false, ["encrypt", "decrypt"]);
+}
+async function seal(key, bytes, aad){
+  const iv = rand(12);
+  return {enc:1, iv, data:await crypto.subtle.encrypt({name:"AES-GCM", iv, additionalData:enc8(aad)}, key, bytes)};
+}
+const unseal = (key, rec, aad) => crypto.subtle.decrypt({name:"AES-GCM", iv:rec.iv, additionalData:enc8(aad)}, key, rec.data);
+
 /* ================= Storage =================
    IndexedDB is the primary store: quota is disk-based rather than localStorage's ~5 MB,
    writes are async (no main-thread stall on photos), and receipts are kept as Blobs in
    their own object store — so editing a note no longer rewrites megabytes of base64.
-   Falls back to localStorage, then to memory-only, without the UI caring which. */
+   Falls back to localStorage, then to memory-only, without the UI caring which.
+   Encryption at rest exists in IndexedDB mode only (Store.key set = write encrypted). */
 const Store = {
   mode: "memory",                 // "idb" | "local" | "memory"
   db: null,
+  key: null,                      // AES-GCM key while the stored ledger is encrypted
+  queue: Promise.resolve(),
   memLedger: null,
   memRcpt: new Map(),
 
@@ -844,11 +897,7 @@ const Store = {
       /* A slow or blocked open is NOT "no IndexedDB": the real ledger is probably in there.
          Falling back would show an empty ledger and start writing to the wrong store. */
       if(e && e.transient) throw e;
-      try{
-        localStorage.setItem("__probe__", "1");
-        localStorage.removeItem("__probe__");
-        this.mode = "local";
-      }catch(e2){ this.mode = "memory"; }
+      this.mode = lsSet("__probe__", "1") && lsSet("__probe__", "") ? "local" : "memory";
     }
     return this.mode;
   },
@@ -884,35 +933,84 @@ const Store = {
       t.onerror = t.onabort = () => rej(t.error || new Error("tx failed"));
     });
   },
+  /* One all-or-nothing write across the ledger and the receipts. */
+  both(fn){
+    return new Promise((res, rej) => {
+      let t;
+      try{ t = this.db.transaction([S_META, S_RCPT], "readwrite"); }catch(e){ return rej(e); }
+      t.oncomplete = () => res();
+      t.onerror = t.onabort = () => rej(t.error || new Error("tx failed"));
+      try{ fn(t.objectStore(S_META), t.objectStore(S_RCPT)); }
+      catch(e){ try{ t.abort(); }catch(e2){} rej(e); }
+    });
+  },
+  /* Writes run one at a time, in order. Encrypting is async, so without this two quick
+     saves could land out of order and the older one would win. */
+  serial(fn){
+    const p = this.queue.then(fn);
+    this.queue = p.catch(() => {});
+    return p;
+  },
 
+  /* The encrypted ledger carries the passkey id + salt needed to unlock it, so a lost
+     localStorage copy of the lock can neither lock the owner out nor skip the lock. */
+  async sealLedger(key, data){
+    const lock = getFaceLock();
+    return Object.assign(await seal(key, enc8(JSON.stringify(data)), AAD_LEDGER), {v:1, credId:lock.credId, salt:lock.salt});
+  },
+  async openLedger(key, rec){ return JSON.parse(new TextDecoder().decode(await unseal(key, rec, AAD_LEDGER))); },
+  async sealBlob(key, id, blob){ return Object.assign(await seal(key, await blob.arrayBuffer(), aadRcpt(id)), {type:blob.type}); },
+  async openBlob(key, id, rec){ return new Blob([await unseal(key, rec, aadRcpt(id))], {type:rec.type || "image/jpeg"}); },
+
+  /* The stored record exactly as it sits on disk (encrypted or not). */
+  rawLedger(){ return this.mode === "idb" ? this.tx(S_META, "readonly", s => s.get(LEDGER_KEY)) : null; },
   async loadLedger(){
-    if(this.mode === "idb") return this.tx(S_META, "readonly", s => s.get(LEDGER_KEY));
+    if(this.mode === "idb"){
+      const rec = await this.rawLedger();
+      if(!isSealed(rec)) return rec;
+      if(!this.key) throw new Error("The ledger is encrypted and Face ID gave no key");
+      return this.openLedger(this.key, rec);
+    }
     if(this.mode === "local"){
       const raw = lsGet(LS_LEDGER);
       return raw ? JSON.parse(raw) : null;
     }
     return this.memLedger;
   },
-  async saveLedger(data){
-    if(this.mode === "idb") return this.tx(S_META, "readwrite", s => s.put(data, LEDGER_KEY));
-    if(this.mode === "local") return localStorage.setItem(LS_LEDGER, JSON.stringify(data));
-    this.memLedger = data;
+  saveLedger(data){
+    return this.serial(async () => {
+      if(this.mode === "idb"){
+        const rec = this.key ? await this.sealLedger(this.key, data) : data;
+        return this.tx(S_META, "readwrite", s => s.put(rec, LEDGER_KEY));
+      }
+      if(this.mode === "local") return localStorage.setItem(LS_LEDGER, JSON.stringify(data));
+      this.memLedger = data;
+    });
   },
 
   /* Receipts: Blob under IDB, data URL under localStorage. Callers treat both via receiptURL(). */
   async getReceipt(id){
-    if(this.mode === "idb") return (await this.tx(S_RCPT, "readonly", s => s.get(id))) || null;
+    if(this.mode === "idb"){
+      const v = await this.tx(S_RCPT, "readonly", s => s.get(id));
+      if(!v) return null;
+      return isSealed(v) ? (this.key ? this.openBlob(this.key, id, v) : null) : v;
+    }
     if(this.mode === "local") return this.lsRcpt()[id] || null;
     return this.memRcpt.get(id) || null;
   },
-  async putReceipt(id, blob){
-    if(this.mode === "idb") return this.tx(S_RCPT, "readwrite", s => s.put(blob, id));
-    if(this.mode === "local"){
-      const map = this.lsRcpt();
-      map[id] = await blobToDataURL(blob);
-      return localStorage.setItem(LS_RCPT, JSON.stringify(map));
-    }
-    this.memRcpt.set(id, blob);
+  putReceipt(id, blob){
+    return this.serial(async () => {
+      if(this.mode === "idb"){
+        const v = this.key ? await this.sealBlob(this.key, id, blob) : blob;
+        return this.tx(S_RCPT, "readwrite", s => s.put(v, id));
+      }
+      if(this.mode === "local"){
+        const map = this.lsRcpt();
+        map[id] = await blobToDataURL(blob);
+        return localStorage.setItem(LS_RCPT, JSON.stringify(map));
+      }
+      this.memRcpt.set(id, blob);
+    });
   },
   async delReceipt(ids){
     const list = Array.isArray(ids) ? ids : [ids];
@@ -924,51 +1022,75 @@ const Store = {
     }
     list.forEach(i => this.memRcpt.delete(i));
   },
-  async clear(){
-    if(this.mode === "idb") return Promise.all([
-      this.tx(S_META, "readwrite", s => s.clear()),
-      this.tx(S_RCPT, "readwrite", s => s.clear())
-    ]);
-    if(this.mode === "local"){
-      localStorage.removeItem(LS_LEDGER);
-      localStorage.removeItem(LS_RCPT);
-      return;
-    }
-    this.memLedger = null;
-    this.memRcpt.clear();
+  clear(){
+    return this.serial(async () => {
+      if(this.mode === "idb") return this.both((meta, rc) => { meta.clear(); rc.clear(); });
+      if(this.mode === "local"){ lsSet(LS_LEDGER, ""); lsSet(LS_RCPT, ""); return; }
+      this.memLedger = null;
+      this.memRcpt.clear();
+    });
   },
   /* Swaps in a whole new ledger + photo set atomically (used by "Replace" import). */
-  async replaceAll(ledger, blobs){
-    if(this.mode === "idb"){
-      return new Promise((res, rej) => {
-        let t;
-        try{ t = this.db.transaction([S_META, S_RCPT], "readwrite"); }catch(e){ return rej(e); }
-        const meta = t.objectStore(S_META), rc = t.objectStore(S_RCPT);
-        meta.clear(); rc.clear();
-        meta.put(ledger, LEDGER_KEY);
-        blobs.forEach((b, id) => rc.put(b, id));
-        t.oncomplete = () => res();
-        t.onerror = t.onabort = () => rej(t.error || new Error("tx failed"));
-      });
-    }
-    if(this.mode === "local"){
-      const oldL = lsGet(LS_LEDGER), oldR = lsGet(LS_RCPT);
-      const map = {};
-      for(const [id, b] of blobs) map[id] = await blobToDataURL(b);
-      try{
-        localStorage.setItem(LS_RCPT, JSON.stringify(map));
-        localStorage.setItem(LS_LEDGER, JSON.stringify(ledger));
-      }catch(e){
-        try{
-          oldR == null ? localStorage.removeItem(LS_RCPT) : localStorage.setItem(LS_RCPT, oldR);
-          oldL == null ? localStorage.removeItem(LS_LEDGER) : localStorage.setItem(LS_LEDGER, oldL);
-        }catch(e2){}
-        throw e;
+  replaceAll(ledger, blobs){
+    return this.serial(async () => {
+      if(this.mode === "idb"){
+        const key = this.key, out = new Map();
+        const rec = key ? await this.sealLedger(key, ledger) : ledger;
+        for(const [id, b] of blobs) out.set(id, key ? await this.sealBlob(key, id, b) : b);
+        return this.both((meta, rc) => {
+          meta.clear(); rc.clear();
+          meta.put(rec, LEDGER_KEY);
+          out.forEach((b, id) => rc.put(b, id));
+        });
       }
-      return;
-    }
-    this.memLedger = ledger;
-    this.memRcpt = new Map(blobs);
+      if(this.mode === "local"){
+        const oldL = lsGet(LS_LEDGER), oldR = lsGet(LS_RCPT);
+        const map = {};
+        for(const [id, b] of blobs) map[id] = await blobToDataURL(b);
+        try{
+          localStorage.setItem(LS_RCPT, JSON.stringify(map));
+          localStorage.setItem(LS_LEDGER, JSON.stringify(ledger));
+        }catch(e){
+          lsSet(LS_RCPT, oldR); lsSet(LS_LEDGER, oldL);
+          throw e;
+        }
+        return;
+      }
+      this.memLedger = ledger;
+      this.memRcpt = new Map(blobs);
+    });
+  },
+  /* Rewrites everything on disk encrypted under newKey — or as plain data when newKey is
+     null — in one transaction. Used when the Face ID lock is switched on or off. If any
+     step fails, nothing on disk has changed. IndexedDB mode only. */
+  reseal(newKey, ledger){
+    return this.serial(async () => {
+      const [ids, vals] = await this.allReceipts();
+      const out = new Map();
+      for(let i = 0; i < ids.length; i++){
+        const blob = isSealed(vals[i]) ? await this.openBlob(this.key, ids[i], vals[i]) : vals[i];
+        out.set(ids[i], newKey ? await this.sealBlob(newKey, ids[i], blob) : blob);
+      }
+      const rec = newKey ? await this.sealLedger(newKey, ledger) : ledger;
+      if(newKey) await this.openLedger(newKey, rec);      // prove it reads back before replacing anything
+      await this.both((meta, rc) => {
+        meta.put(rec, LEDGER_KEY);
+        out.forEach((b, id) => rc.put(b, id));
+      });
+      this.key = newKey;
+    });
+  },
+  allReceipts(){
+    return new Promise((res, rej) => {
+      let t, k, v;
+      try{
+        t = this.db.transaction(S_RCPT, "readonly");
+        const s = t.objectStore(S_RCPT);
+        k = s.getAllKeys(); v = s.getAll();
+      }catch(e){ return rej(e); }
+      t.oncomplete = () => res([k.result, v.result]);
+      t.onerror = t.onabort = () => rej(t.error || new Error("tx failed"));
+    });
   },
   async receiptIds(){
     if(this.mode === "idb") return (await this.tx(S_RCPT, "readonly", s => s.getAllKeys())) || [];
@@ -980,8 +1102,6 @@ const Store = {
   }
 };
 
-const lsGet = k => { try{ return localStorage.getItem(k); }catch(e){ return null; } };
-showSettled = lsGet(SETTLED_KEY) === "1";
 const blobToDataURL = b => new Promise(res => {
   const r = new FileReader();
   r.onload = () => res(r.result);
@@ -1006,7 +1126,9 @@ function persist(){
   if(!bootOk) return;
   saveDirty = true;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(flush, 200);
+  /* An encrypted save is async before it reaches disk, so it starts at once instead of
+     waiting — leaving the app right after a change must not lose it. */
+  saveTimer = setTimeout(flush, Store.key ? 0 : 200);
 }
 async function flush(){
   if(!saveDirty || !bootOk) return;
@@ -1066,26 +1188,21 @@ function loadTheme(){
 }
 
 /* ================= Face ID Lock =================
-   A local device gate, not encryption: WebAuthn's platform authenticator (Face ID /
-   iPhone) is used purely to prove the OS's biometric check passed
-   before the UI reveals anything. The credential id is kept per-device in localStorage
-   (never inside the ledger/backup) so it never travels with an export or import. */
-const b64uEncode = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-const b64uDecode = str => {
-  const pad = "=".repeat((4 - str.length % 4) % 4);
-  const bin = atob((str + pad).replace(/-/g, "+").replace(/_/g, "/"));
-  const arr = new Uint8Array(bin.length);
-  for(let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr.buffer;
-};
-function getFaceLock(){
+   WebAuthn's platform authenticator (Face ID) proves the iPhone's biometric check passed
+   before the UI reveals anything, and — where the passkey supports PRF — releases the
+   secret that decrypts the stored ledger (see "Ledger encryption at rest").
+   Lock state is kept per-device (never inside a backup), so it never travels with an
+   export or import. */
+let faceLock = (() => {
   try{
     const v = JSON.parse(lsGet(FACE_LOCK_KEY) || "null");
     return (v && v.enabled && v.credId) ? v : null;
   }catch(e){ return null; }
-}
+})();
+const getFaceLock = () => faceLock;
 function setFaceLock(v){
-  try{ v ? localStorage.setItem(FACE_LOCK_KEY, JSON.stringify(v)) : localStorage.removeItem(FACE_LOCK_KEY); }catch(e){}
+  faceLock = v || null;
+  lsSet(FACE_LOCK_KEY, v ? JSON.stringify(v) : "");
 }
 async function faceIDSupported(){
   if(!window.PublicKeyCredential || !navigator.credentials) return false;
@@ -1097,79 +1214,114 @@ const FACE_USER_KEY = "debtTrackerFaceUser_v1";
 function faceUserId(){
   let v = lsGet(FACE_USER_KEY);
   if(!v){
-    v = b64uEncode(crypto.getRandomValues(new Uint8Array(16)));
-    try{ localStorage.setItem(FACE_USER_KEY, v); }catch(e){}
+    v = b64uEncode(rand(16));
+    lsSet(FACE_USER_KEY, v);
   }
-  return new Uint8Array(b64uDecode(v));
+  return b64uDecode(v);
 }
+const prfExt = salt => ({prf:{eval:{first:salt}}});
+const prfOf = cred => { try{ return cred.getClientExtensionResults().prf || null; }catch(e){ return null; } };
+/* Creates the passkey. `out` is the ledger secret if the iPhone handed it over at
+   set-up; `capable` says the passkey can produce one on a later check. */
 async function enrollFaceID(){
+  const salt = rand(32);
   const cred = await navigator.credentials.create({
     publicKey:{
-      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      challenge: rand(32),
       rp:{name:"Debt Tracker"},
       user:{id: faceUserId(), name:"ledger", displayName:"Debt Tracker"},
       pubKeyCredParams:[{type:"public-key", alg:-7}, {type:"public-key", alg:-257}],
       authenticatorSelection:{authenticatorAttachment:"platform", userVerification:"required"},
-      timeout:60000, attestation:"none"
+      timeout:60000, attestation:"none", extensions:prfExt(salt)
     }
   });
   if(!cred) throw new Error("No credential returned");
-  setFaceLock({enabled:true, credId:b64uEncode(cred.rawId)});
+  setFaceLock({enabled:true, credId:b64uEncode(cred.rawId), salt:b64uEncode(salt)});
+  const prf = prfOf(cred), out = (prf && prf.results && prf.results.first) || null;
+  return {out, capable: !!(out || (prf && prf.enabled))};
 }
+/* Resolves once Face ID passes, with the ledger secret (or null if the passkey has none). */
 async function verifyFaceID(lock){
-  await navigator.credentials.get({
-    publicKey:{
-      challenge: crypto.getRandomValues(new Uint8Array(32)),
-      allowCredentials:[{id:b64uDecode(lock.credId), type:"public-key"}],
-      userVerification:"required",
-      timeout:60000
-    }
-  });
+  const publicKey = {
+    challenge: rand(32),
+    allowCredentials:[{id:b64uDecode(lock.credId), type:"public-key"}],
+    userVerification:"required",
+    timeout:60000
+  };
+  if(lock.salt) publicKey.extensions = prfExt(b64uDecode(lock.salt));
+  const prf = prfOf(await navigator.credentials.get({publicKey}));
+  return (prf && prf.results && prf.results.first) || null;
 }
 function syncFaceIDUI(){
-  const toggle = $("faceIdToggle");
-  if(!toggle) return;
-  const enabled = !!getFaceLock();
+  const toggle = $("faceIdToggle"), enabled = !!getFaceLock();
   toggle.classList.toggle("on", enabled);
   toggle.setAttribute("aria-checked", enabled ? "true" : "false");
+  $("faceIdSub").textContent = !enabled ? "Require Face ID to open the app."
+    : Store.key ? "On. The ledger is encrypted on this iPhone."
+    : "On. Screen lock only — the ledger isn't encrypted.";
+}
+/* Encrypts the stored ledger with the secret Face ID handed over. Resolves true if the
+   ledger is encrypted afterwards. Never throws: on any failure the stored ledger is
+   left exactly as it was. */
+async function sealWith(prfOut){
+  if(Store.key) return true;
+  if(!prfOut || Store.mode !== "idb" || !bootOk) return false;
+  try{
+    await Store.reseal(await ledgerKeyFrom(prfOut), state);
+    lsSet(LS_KEY, "");                     // the old pre-v3 copy was plain text
+    return true;
+  }catch(e){
+    console.error("Debt Tracker: couldn't encrypt the ledger", e);
+    return false;
+  }finally{ syncFaceIDUI(); }
+}
+async function turnFaceOn(){
+  let made;
+  try{ made = await enrollFaceID(); }
+  catch(e){ return showError("Couldn't set up Face ID. Try again."); }
+  let out = made.out;
+  /* Some iPhones only hand the secret over on a check, not at set-up — ask once more. */
+  if(!out && made.capable){ try{ out = await verifyFaceID(getFaceLock()); }catch(e){} }
+  if(await sealWith(out)) showOk("Face ID on. Ledger encrypted.");
+  else renderToast(made.capable && Store.mode === "idb"
+    ? "Face ID on. The ledger will be encrypted at your next unlock."
+    : "Face ID on — screen lock only. This iPhone can't encrypt the ledger.", null, null, 5000);
+}
+async function turnFaceOff(){
+  try{ await verifyFaceID(getFaceLock()); }
+  catch(e){ return showError("Face ID didn't verify — lock is still on."); }
+  /* Decrypt first: once the lock is gone there is no key left to read the ledger with. */
+  try{ if(Store.key) await Store.reseal(null, state); }
+  catch(e){ return showError("Couldn't decrypt the ledger — lock is still on."); }
+  setFaceLock(null);
+  showOk("Face ID turned off.");
 }
 let faceBusy = false;                      // a second tap must not stack a second Face ID prompt
-on($("faceIdToggle"), "click", async () => {
+async function faceTask(fn){
   if(faceBusy) return;
   faceBusy = true;
-  try{
-    const lock = getFaceLock();
-    if(lock){
-      /* Turning the lock off needs the same proof as unlocking. */
-      try{ await verifyFaceID(lock); }
-      catch(e){ return showError("Face ID didn't verify — lock is still on."); }
-      setFaceLock(null);
-      syncFaceIDUI();
-      return showOk("Face ID turned off.");
-    }
-    if(!(await faceIDSupported())) return showError("Face ID isn't available on this device or browser.");
-    try{
-      await enrollFaceID();
-      syncFaceIDUI();
-      showOk("Face ID enabled.");
-    }catch(e){
-      showError("Couldn't set up Face ID. Try again.");
-    }
-  }finally{ faceBusy = false; }
+  try{ await fn(); }finally{ faceBusy = false; syncFaceIDUI(); }
+}
+on($("faceIdToggle"), "click", async () => {
+  if(faceBusy) return;
+  if(getFaceLock()) return faceTask(turnFaceOff);
+  if(!(await faceIDSupported())) return showError("Face ID isn't available on this device or browser.");
+  appConfirm("Face ID will lock the app and encrypt the ledger on this iPhone. If its passkey is ever deleted from Passwords, only a backup file can bring your data back.",
+    () => faceTask(turnFaceOn), "Turn On", null, "Face ID Lock");
 });
-faceIDSupported().then(ok => { if(!ok && $("faceIdRow")) $("faceIdRow").style.display = "none"; });
+faceIDSupported().then(ok => { if(!ok) $("faceIdRow").style.display = "none"; });
 
 /* Gates the boot itself — resolves once unlocked (or immediately if no lock is set),
-   so nothing above it (state load, rendering) ever runs before Face ID passes. */
+   so no state load or rendering ever runs before Face ID passes. Resolves with the
+   ledger secret, or null. `needKey` = the stored ledger is encrypted, so a pass that
+   brings no secret is not enough to get in. */
 const FACE_MAX_ATTEMPTS = 5, FACE_COOLDOWN_MS = 15 * 60000;
 const FACE_UNTIL_KEY = "debtTrackerFaceUntil_v1";
 /* Panic wipe: erases every local store and reloads to a blank, unlocked app. Runs
    before Store.init(), so it clears the raw persistence layer directly rather than
    going through Store — matches iOS's "erase data" after too many failed passcode tries. */
 async function faceIDLogout(){
-  [LS_LEDGER, LS_RCPT, LS_KEY, MIGRATED_KEY, FACE_LOCK_KEY, FACE_FAILS_KEY, FACE_UNTIL_KEY, SETTLED_KEY, LAST_EXPORT_KEY].forEach(k => {
-    try{ localStorage.removeItem(k); }catch(e){}
-  });
+  [LS_LEDGER, LS_RCPT, LS_KEY, MIGRATED_KEY, FACE_LOCK_KEY, FACE_FAILS_KEY, FACE_UNTIL_KEY, SETTLED_KEY, LAST_EXPORT_KEY].forEach(k => lsSet(k, ""));
   await new Promise(res => {
     try{
       const req = indexedDB.deleteDatabase(DB_NAME);
@@ -1178,11 +1330,11 @@ async function faceIDLogout(){
   });
   location.reload();
 }
-function ensureUnlocked(){
+function ensureUnlocked(needKey){
   return new Promise(resolve => {
     const lock = getFaceLock();
     const screen = $("lockScreen");
-    if(!lock || screen.classList.contains("open")) return resolve();
+    if(!lock || screen.classList.contains("open")) return resolve(null);
 
     const tile = $("lockTile"), sub = $("lockSub"),
           retryBtn = $("lockRetryBtn"), cantBtn = $("lockCantBtn"),
@@ -1202,13 +1354,12 @@ function ensureUnlocked(){
        means a 15-minute cool-down, never an automatic or one-tap wipe. */
     let busy = false, fails = parseInt(lsGet(FACE_FAILS_KEY) || "0", 10) || 0;
     let lockedUntil = parseInt(lsGet(FACE_UNTIL_KEY) || "0", 10) || 0, coolTimer = null;
-    const saveFails = n => { try{ n ? localStorage.setItem(FACE_FAILS_KEY, String(n)) : localStorage.removeItem(FACE_FAILS_KEY); }catch(e){} };
-    const saveUntil = t => { try{ t ? localStorage.setItem(FACE_UNTIL_KEY, String(t)) : localStorage.removeItem(FACE_UNTIL_KEY); }catch(e){} };
+    const saveFails = n => lsSet(FACE_FAILS_KEY, n), saveUntil = t => lsSet(FACE_UNTIL_KEY, t);
     setAppInert(true);
-    const finish = () => {
+    const finish = out => {
       clearTimeout(coolTimer);
       saveFails(0); saveUntil(0);
-      screen.classList.remove("open", "cover"); setAppInert(false); syncLock(); resolve();
+      screen.classList.remove("open", "cover"); setAppInert(false); syncLock(); resolve(out);
     };
     const endCoolDown = () => {
       fails = 0; lockedUntil = 0; saveFails(0); saveUntil(0);
@@ -1240,8 +1391,13 @@ function ensureUnlocked(){
       sub.classList.remove("error");
       sub.textContent = "Locked with Face ID";
       try{
-        await verifyFaceID(lock);
-        finish();
+        const out = await verifyFaceID(lock);
+        if(needKey && !out){
+          sub.classList.add("error");
+          sub.textContent = "Face ID passed, but the ledger key didn't arrive. Try again.";
+          return;
+        }
+        finish(out);
         return;
       }catch(e){
         if(auto === true || cancelled(e)){ sub.textContent = "Tap below to unlock"; return; }
@@ -1298,27 +1454,29 @@ function setAppInert(v){
     el.inert = v;
   }
 }
+const lockScreenEl = $("lockScreen");
+const coverIfLocked = () => { if(getFaceLock() && !lockScreenEl.classList.contains("open")) lockScreenEl.classList.add("cover"); };
+/* A ledger that couldn't be encrypted when the lock was set up is encrypted here. */
+const relock = () => ensureUnlocked().then(sealWith);
 on(document, "visibilitychange", () => {
-  const screen = $("lockScreen");
   if(document.hidden){
     hiddenAt = Date.now();
-    if(getFaceLock() && !screen.classList.contains("open")) screen.classList.add("cover");
+    coverIfLocked();
     return;
   }
   const away = hiddenAt ? Date.now() - hiddenAt : 0;
   hiddenAt = 0;
-  if(getFaceLock() && away > RELOCK_AFTER_MS) ensureUnlocked();
-  screen.classList.remove("cover");
+  if(away > RELOCK_AFTER_MS) relock();
+  lockScreenEl.classList.remove("cover");
 });
 /* iOS can take the app-switcher snapshot around pagehide as well as visibilitychange —
    cover on both so balances never end up in the snapshot. */
-on(window, "pagehide", () => {
-  const screen = $("lockScreen");
-  if(getFaceLock() && !screen.classList.contains("open")) screen.classList.add("cover");
-});
+on(window, "pagehide", coverIfLocked);
 on(window, "pageshow", e => {
-  if(e.persisted && getFaceLock()) ensureUnlocked();
-  else if(!document.hidden) $("lockScreen").classList.remove("cover");
+  if(e.persisted) relock();
+  /* Always lift the cover: it hides the Unlock button, so leaving it on over the lock
+     screen left a blank screen with no way in. */
+  if(!document.hidden) lockScreenEl.classList.remove("cover");
 });
 
 /* ================= Toast ================= */
@@ -1634,7 +1792,13 @@ const closeOverlay = o => {
 };
 const isOpen = o => o.classList.contains("open");
 /* The password never lingers: a stale one would silently encrypt the next export. */
-function closeBackup(){ closeOverlay(backupOverlay); $("backupPassword").value = ""; }
+function closeBackup(){
+  closeOverlay(backupOverlay);
+  const f = $("backupPassword");
+  f.value = ""; f.type = "password";
+  $("backupPwShow").textContent = "Show password";
+  showErrIn("backupErr", "");
+}
 
 let pendingConfirm = null, pendingAlt = null;
 /* alt = {label, fn} renders a second, non-destructive choice beside the primary one. */
@@ -1650,19 +1814,14 @@ function appConfirm(msg, action, yesLabel, alt, title){
 }
 function cancelConfirm(){ pendingConfirm = pendingAlt = null; closeOverlay(confirmOverlay); }
 
+const answerConfirm = pick => () => {
+  const a = pick();
+  cancelConfirm();
+  if(a) a();
+};
 on($("confirmNoBtn"), "click", cancelConfirm);
-on($("confirmYesBtn"), "click", () => {
-  const a = pendingConfirm;
-  pendingConfirm = pendingAlt = null;
-  closeOverlay(confirmOverlay);
-  if(a) a();
-});
-on($("confirmAltBtn"), "click", () => {
-  const a = pendingAlt;
-  pendingConfirm = pendingAlt = null;
-  closeOverlay(confirmOverlay);
-  if(a) a();
-});
+on($("confirmYesBtn"), "click", answerConfirm(() => pendingConfirm));
+on($("confirmAltBtn"), "click", answerConfirm(() => pendingAlt));
 
 /* Tapping the backdrop closes that layer through its own cleanup function. */
 const SHEET_LAYERS = [[overlay, closeSheet], [personOverlay, closePersonSheet], [confirmOverlay, cancelConfirm],
@@ -1697,6 +1856,7 @@ function dropReceiptURL(id){
   if(u && u.startsWith("blob:")) URL.revokeObjectURL(u);
   urlCache.delete(id);
 }
+function dropAllReceiptURLs(){ [...urlCache.keys()].forEach(dropReceiptURL); }
 function releaseTemp(){
   if(rcpt.temp && rcpt.url) URL.revokeObjectURL(rcpt.url);
 }
@@ -1766,12 +1926,16 @@ function populatePersonSelect(selectedId){
   personSelect.value = selectedId != null ? String(selectedId) : (state.people.length ? "" : "__new__");
   newPersonName.style.display = personSelect.value === "__new__" ? "block" : "none";
 }
+const sortedMethods = () => [...state.paymentTypes].sort((a, b) => a.localeCompare(b));
+/* `extra` keeps a transaction's own (since-removed) payment type selectable. */
+function methodOptions(extra){
+  const methods = sortedMethods();
+  if(extra && !methods.includes(extra)) methods.push(extra);
+  return '<option value="__none__">Not specified</option>'
+    + methods.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join("");
+}
 function populateMethodSelect(selected){
-  const methods = [...state.paymentTypes].sort((a, b) => a.localeCompare(b));
-  if(selected && !methods.includes(selected)) methods.push(selected);
-  methodSelect.innerHTML = '<option value="__none__">Not specified</option>'
-    + methods.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join("")
-    + '<option value="__new__">+ Add new payment type</option>';
+  methodSelect.innerHTML = methodOptions(selected) + '<option value="__new__">+ Add new payment type</option>';
   methodSelect.value = selected || "__none__";
   newMethodName.style.display = "none";
   newMethodName.value = "";
@@ -1867,12 +2031,6 @@ function setSettleDate(d){
   settleDateInput.value = toLocalInput(settleDate);
   settleDateInput.max = toLocalInput(new Date());
 }
-function populateSettleMethodSelect(){
-  const methods = [...state.paymentTypes].sort((a, b) => a.localeCompare(b));
-  settleMethodSelect.innerHTML = '<option value="__none__">Not specified</option>'
-    + methods.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join("");
-  settleMethodSelect.value = "__none__";
-}
 function openSettle(personId){
   const p = findPerson(personId);
   const bal = balanceNow(personId);
@@ -1885,7 +2043,8 @@ function openSettle(personId){
     ? `${p.name} owes you ${money(bal)}. Record what they've paid back — in full, or part of it.`
     : `You owe ${p.name} ${money(bal)}. Record what you've paid back — in full, or part of it.`;
   setSettleAmountCents(settleMaxCents);       // most settle-ups are in full; edit for part
-  populateSettleMethodSelect();
+  settleMethodSelect.innerHTML = methodOptions();
+  settleMethodSelect.value = "__none__";
   $("settleNoteInput").value = "";
   setSettleDate(new Date());
   openOverlay(settleOverlay);
@@ -2021,7 +2180,7 @@ async function saveTxn(){
     const t = {
       id: state.nextTxnId, person_id: personId, type: selectedType, amount,
       payment_type: "", note, txn_date: txnDate.toISOString(),
-      created_at: new Date().toISOString(), edited: 0, edited_at: null, receipt: 0
+      created_at: new Date().toISOString(), edited: 0, edited_at: null, receipt: 0, settlement: 0
     };
     await commitReceipt(t);
     state.nextTxnId++;
@@ -2341,7 +2500,7 @@ on(document, "click", e => {
 
 on($("settledToggle"), "click", () => {
   showSettled = !showSettled;
-  try{ localStorage.setItem(SETTLED_KEY, showSettled ? "1" : "0"); }catch(e){}
+  lsSet(SETTLED_KEY, showSettled ? "1" : "0");
   renderPeople();
 });
 
@@ -2457,8 +2616,7 @@ on($("deleteAllInput"), "input", function(){ $("deleteAllConfirmBtn").disabled =
 on($("deleteAllConfirmBtn"), "click", async () => {
   if($("deleteAllInput").value.trim().toUpperCase() !== "DELETE") return;
   commitTrash();
-  urlCache.forEach((u, id) => dropReceiptURL(id));
-  urlCache.clear();
+  dropAllReceiptURLs();
   state = blank();
   openPersonId = editingTxnId = editingPersonId = null;
   try{ await Store.clear(); }catch(e){}
@@ -2470,8 +2628,7 @@ on($("deleteAllConfirmBtn"), "click", async () => {
 const setPtErr = msg => showErrIn("ptErr", msg);
 
 function renderPtList(){
-  const list = $("ptList");
-  const methods = [...state.paymentTypes].sort((a, b) => a.localeCompare(b));
+  const list = $("ptList"), methods = sortedMethods();
   if(!methods.length){ list.innerHTML = '<div class="txn-note">No payment methods yet.</div>'; return; }
   const counts = new Map();
   state.transactions.forEach(t => counts.set(t.payment_type, (counts.get(t.payment_type) || 0) + 1));
@@ -2583,53 +2740,63 @@ async function download(filename, text, mime){
 }
 const stamp = () => toLocalDay(new Date());
 
-/* ---- Backup encryption: PBKDF2-SHA256 → AES-256-GCM, all on-device via WebCrypto. ---- */
-const ENC_FORMAT = "debt-tracker-encrypted", ENC_ITER = 310000;
-const u8ToB64 = u8 => { let s = ""; for(let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000)); return btoa(s); };
-const b64ToU8 = b64 => { const bin = atob(b64); const u = new Uint8Array(bin.length); for(let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+/* ---- Backup encryption: PBKDF2-SHA256 → AES-256-GCM, all on-device via WebCrypto.
+   v2 files (written now): 600k rounds, password NFKC-normalised, and the file header is
+   authenticated, so nobody can alter it without the import failing. v1 files (310k
+   rounds, no header check) still import. ---- */
+const ENC_FORMAT = "debt-tracker-encrypted", ENC_ITER = 600000, PW_MIN = 8;
+const encHeader = (iter, salt) => enc8(`${ENC_FORMAT}|2|${iter}|${salt}`);
 async function deriveKey(password, salt, iter){
-  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
+  const base = await crypto.subtle.importKey("raw", enc8(password), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey({name:"PBKDF2", salt, iterations:iter, hash:"SHA-256"}, base, {name:"AES-GCM", length:256}, false, ["encrypt", "decrypt"]);
 }
 async function encryptText(text, password){
-  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveKey(password, salt, ENC_ITER);
-  const data = new Uint8Array(await crypto.subtle.encrypt({name:"AES-GCM", iv}, key, new TextEncoder().encode(text)));
-  return JSON.stringify({format:ENC_FORMAT, v:1, iter:ENC_ITER, salt:u8ToB64(salt), iv:u8ToB64(iv), data:u8ToB64(data)});
+  const salt = u8ToB64(rand(16)), iv = rand(12);
+  const key = await deriveKey(password.normalize("NFKC"), b64ToU8(salt), ENC_ITER);
+  const data = new Uint8Array(await crypto.subtle.encrypt({name:"AES-GCM", iv, additionalData:encHeader(ENC_ITER, salt)}, key, enc8(text)));
+  return JSON.stringify({format:ENC_FORMAT, v:2, iter:ENC_ITER, salt, iv:u8ToB64(iv), data:u8ToB64(data)});
 }
 async function decryptText(obj, password){
-  const iter = Math.min(Math.max(parseInt(obj.iter, 10) || ENC_ITER, 100000), 5000000);
-  const key = await deriveKey(password, b64ToU8(obj.salt), iter);
-  const plain = await crypto.subtle.decrypt({name:"AES-GCM", iv:b64ToU8(obj.iv)}, key, b64ToU8(obj.data));
-  return new TextDecoder().decode(plain);
+  const v2 = Number(obj.v) >= 2;
+  /* Clamped: a crafted file can't ask for a trivially weak or an hours-long derivation. */
+  const iter = clamp(parseInt(obj.iter, 10) || 310000, 100000, 5000000);
+  const key = await deriveKey(v2 ? password.normalize("NFKC") : password, b64ToU8(obj.salt), iter);
+  const alg = {name:"AES-GCM", iv:b64ToU8(obj.iv)};
+  if(v2) alg.additionalData = encHeader(iter, obj.salt);
+  return new TextDecoder().decode(await crypto.subtle.decrypt(alg, key, b64ToU8(obj.data)));
 }
+on($("backupPwShow"), "click", () => {
+  const f = $("backupPassword"), show = f.type === "password";
+  f.type = show ? "text" : "password";
+  $("backupPwShow").textContent = show ? "Hide password" : "Show password";
+});
 
 function markExported(){
-  try{ localStorage.setItem(LAST_EXPORT_KEY, String(Date.now())); }catch(e){}
-  const r = $("backupReminder");
-  if(r) r.remove();
+  lsSet(LAST_EXPORT_KEY, Date.now());
+  $("backupReminder")?.remove();
 }
 
-/* The .json backup inlines photos as data URLs so a single file restores everything. */
+/* The .json backup inlines photos as data URLs so a single file restores everything.
+   It is always encrypted — a plain copy of the ledger never leaves the app this way. */
 let exporting = false;
 on($("exportBtn"), "click", async () => {
   if(exporting) return;
+  const pw = $("backupPassword").value;
+  if(pw.length < PW_MIN) return showErrIn("backupErr", `Enter a backup password of at least ${PW_MIN} characters.`);
+  showErrIn("backupErr", "");
   exporting = true;
   try{
-    const pw = $("backupPassword").value;
-    toast(pw ? "Encrypting backup…" : "Preparing backup…");
+    toast("Encrypting backup…");
     const out = JSON.parse(JSON.stringify(state));
     await Promise.all(out.transactions.map(async t => {
       if(!t.receipt){ t.receipt = null; return; }
       const v = await Store.getReceipt(t.id);
       t.receipt = !v ? null : (typeof v === "string" ? v : await blobToDataURL(v));
     }));
-    let text = JSON.stringify(out);
-    if(pw) text = await encryptText(text, pw);
-    const name = `debt-tracker-backup-${stamp()}${pw ? "-encrypted" : ""}.json`;
-    if(await download(name, text, "application/json")){
+    const text = await encryptText(JSON.stringify(out), pw);
+    if(await download(`debt-tracker-backup-${stamp()}.json`, text, "application/json")){
       markExported();
-      showOk(pw ? "Encrypted backup exported." : "Backup exported — not password-protected.");
+      showOk("Encrypted backup exported.");
     }
   }catch(e){ showError("Export failed — try again."); }
   finally{ exporting = false; }
@@ -2679,7 +2846,8 @@ on($("importFile"), "change", function(){
     }
     if(parsed && parsed.format === ENC_FORMAT){
       const pw = $("backupPassword").value;
-      if(!pw) return showError("This backup is encrypted. Enter its password above, then import again.");
+      if(!pw) return showErrIn("backupErr", "This backup is encrypted. Enter its password, then import again.");
+      showErrIn("backupErr", "");
       try{ parsed = JSON.parse(await decryptText(parsed, pw)); }
       catch(err){ return showError("Wrong password, or the file is damaged."); }
     }
@@ -2706,8 +2874,7 @@ on($("importFile"), "change", function(){
         clearTimeout(saveTimer); saveDirty = false;
         /* One all-or-nothing write: if anything fails, the old ledger is still there. */
         await Store.replaceAll(inc, blobs);
-        urlCache.forEach((u, id) => dropReceiptURL(id));
-        urlCache.clear();
+        dropAllReceiptURLs();
         state = inc;
         openPersonId = editingTxnId = editingPersonId = null;
         closeBackup(); refreshAll(); showOk("Backup restored.");
@@ -2756,7 +2923,7 @@ async function migrateLegacy(){
     const migrated = normalize(JSON.parse(lsGet(LS_KEY)), photos);
     for(const [id, dataUrl] of photos) await Store.putReceipt(id, dataURLtoBlob(dataUrl));
     await Store.saveLedger(migrated);
-    try{ localStorage.setItem(MIGRATED_KEY, "1"); }catch(e){}
+    lsSet(MIGRATED_KEY, "1");
     return migrated;
   }catch(e){ return null; }
 }
@@ -2774,19 +2941,30 @@ async function sweepOrphanReceipts(){
 (async () => {
   try{
     loadTheme();
+    /* Storage is opened first only to see whether the ledger is encrypted. Nothing is
+       loaded into the app, and no error is shown, until Face ID has passed. */
+    let raw = null, initErr = null;
+    try{ await Store.init(); raw = await Store.rawLedger(); }catch(e){ initErr = e; }
+    const sealed = isSealed(raw);
+    if(sealed) setFaceLock({enabled:true, credId:raw.credId, salt:raw.salt});
+    /* A lock set up before encryption existed gets a salt now, so this unlock can
+       already ask its passkey for the ledger secret. */
+    else if(getFaceLock() && !getFaceLock().salt) setFaceLock({...getFaceLock(), salt:b64uEncode(rand(32))});
     syncFaceIDUI();
-    await ensureUnlocked();
+    const secret = await ensureUnlocked(sealed);
+    if(initErr) throw initErr;
+    if(sealed) Store.key = await ledgerKeyFrom(secret);
 
     setRcpt(null);
     setTxnDate(new Date());
 
-    await Store.init();
     if(Store.mode === "memory"){
       showBanner();
       $("storageNote").textContent = "Storage is unavailable here, so nothing saves automatically. Export before you close the page, and import to restore.";
     }
     state = (await migrateLegacy()) || normalize(await Store.loadLedger());
     bootOk = true;                       /* writes are unlocked only once data is really loaded */
+    await sealWith(secret);              /* lock is on but the ledger is still plain → encrypt it now */
     refreshAll();
     sweepOrphanReceipts();
     /* Asks iOS to treat this storage as persistent, so it isn't cleared under space pressure. */
